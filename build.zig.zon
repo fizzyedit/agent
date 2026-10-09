@@ -1,0 +1,14 @@
+.{
+    .name = .agent,
+    .version = "0.1.0",
+    .minimum_zig_version = "0.16.0",
+    .paths = .{ "build.zig", "build.zig.zon", "plugin.zig", "plugin.zig.zon", "src", "bridge", "README.md" },
+    .fingerprint = 0x268b9c9dc0289c64,
+    .dependencies = .{
+        .fizzy = .{
+            // Developed against fizzy's unreleased SDK (commands with arguments, the automation
+            // service's snapshot, the profiler's report): a local workspace until those ship.
+            .path = "../../fizzy-agent-sdk/sdk",
+        },
+    },
+}
