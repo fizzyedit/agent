@@ -7,6 +7,10 @@ server an agent (Claude Code, Codex, Grok's CLI, any MCP client) runs to reach i
   to an agent: `fizzy_commands` lists them, and `fizzy_call` runs one with arguments.
 - **The screen as text.** `fizzy_screen` answers what is drawn: one line per widget worth
   naming, with its role, name, tag and rect, read from the frame dvui just drew.
+- **Scripts in one call.** `fizzy_run` runs a list of steps (input, commands with arguments,
+  waits, expectations, settling, the screen, the profiler) across fizzy's frames and answers one
+  report, with the step that failed and why. Turns are what an agent's iteration costs; a check
+  that took six calls takes one.
 - **Input as a person's.** `fizzy_act` clicks, types and presses keys through the same widgets a
   person uses, as a live tape. Everything shows on screen and lands in undo, and a person's own
   click stops it.

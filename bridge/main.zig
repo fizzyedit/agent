@@ -67,6 +67,31 @@ const tools = [_]Tool{
         ,
     },
     .{
+        .name = "fizzy_run",
+        .calls = "ui.run",
+        .description =
+        \\Run a script in fizzy and get one report: do several things in one call instead of one
+        \\call each. Steps run in order; each is an object with one key. Input and waits play as a
+        \\person's would (a click of theirs stops the run):
+        \\  {"click": {"tag": "..."}} or {"click": {"x": 120, "y": 340}}, {"double_click": ...},
+        \\  {"move": ...}, {"type": "text"}, {"key": "mod+s"}, {"command": "id"},
+        \\  {"wait_for": "tag"}, {"wait_gone": "tag"}
+        \\The rest run between them:
+        \\  {"call": {"id": "text.write", "args": {...}}}  a command with arguments; its result is reported
+        \\  {"expect": {"tag": "...", "shown": true}}    fails the run if not so, now
+        \\  {"settle": {}}                               wait until nothing is in flight
+        \\  {"screen": {}}                               what is on screen, into the report
+        \\  {"profile": {"ms": 500}}                     the profiler's report for that long
+        \\The first step that fails ends the run; the report says which (failed_at) and why.
+        \\Waits and settle give up after timeout_ms.
+        ,
+        .schema =
+        \\{"type":"object","properties":{
+        \\"steps":{"type":"array","items":{"type":"object"}},
+        \\"timeout_ms":{"type":"integer","default":10000}},"required":["steps"]}
+        ,
+    },
+    .{
         .name = "fizzy_commands",
         .calls = "commands.list",
         .description =
@@ -365,6 +390,29 @@ const Bridge = struct {
             var inner: Io.Writer.Allocating = .init(arena);
             toZon(&inner.writer, o.get("args") orelse .{ .object = .{} }, enums) catch return .{ .err = "out of memory" };
             std.zon.stringify.serialize(.{ .id = id, .args = inner.written() }, .{ .whitespace = false }, &w.writer) catch return .{ .err = "out of memory" };
+            return .{ .ok = w.written() };
+        }
+        if (eql(tool.calls, "ui.run")) {
+            // A `call` step's args are a JSON object here and ZON text for the plugin, its enum
+            // parameters as literals (as for fizzy_call).
+            const o = switch (arguments) {
+                .object => |o| o,
+                else => return .{ .err = "fizzy_run takes {\"steps\": [...]}" },
+            };
+            if (o.get("steps")) |steps| if (steps == .array) for (steps.array.items) |*step| {
+                if (step.* != .object) continue;
+                const call_step = step.object.getPtr("call") orelse continue;
+                if (call_step.* != .object) continue;
+                const id = switch (call_step.object.get("id") orelse .null) {
+                    .string => |str| str,
+                    else => continue,
+                };
+                const args = call_step.object.get("args") orelse continue;
+                var inner: Io.Writer.Allocating = .init(arena);
+                toZon(&inner.writer, args, self.enumParams(arena, id)) catch return .{ .err = "out of memory" };
+                call_step.object.put(arena, "args", .{ .string = inner.written() }) catch return .{ .err = "out of memory" };
+            };
+            toZon(&w.writer, arguments, &.{}) catch return .{ .err = "out of memory" };
             return .{ .ok = w.written() };
         }
         if (eql(tool.calls, "tape.play")) {

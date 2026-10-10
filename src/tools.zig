@@ -19,8 +19,8 @@ const std = @import("std");
 const sdk = @import("fizzy_sdk");
 const dvui = @import("dvui");
 const core = @import("core");
-const Script = @import("tape").Script;
 const Server = @import("Server.zig");
+const Run = @import("Run.zig");
 
 const Automation = sdk.services.automation.Api;
 
@@ -32,8 +32,7 @@ const Waiting = struct {
     until: union(enum) {
         snapshot: Automation.SnapshotTicket,
         settled: i96,
-        act: struct { tape: Automation.Ticket, deadline: i96, snapshot: bool },
-        act_snapshot: struct { outcome: []u8, shot: Automation.SnapshotTicket },
+        run: *Run,
         profile: i96,
     },
 };
@@ -65,7 +64,7 @@ pub fn frame(host: *sdk.Host, server: *Server) void {
 pub fn deinit(host: *sdk.Host, server: *Server) void {
     for (waiting.items) |w| {
         switch (w.until) {
-            .act_snapshot => |a| host.allocator.free(a.outcome),
+            .run => |r| r.deinit(host.allocator),
             else => {},
         }
         w.req.answer(server, false, "fizzy is closing");
@@ -85,7 +84,7 @@ fn handle(host: *sdk.Host, server: *Server, req: *Server.Request) void {
     const tool = req.tool;
 
     if (eql(tool, "hello")) return req.answer(server, true,
-        \\.{ .app = "fizzy", .tools = .{ "commands.list", "commands.call", "ui.snapshot", "ui.settled", "ui.act", "tape.play", "tape.outcome", "profile.report" } }
+        \\.{ .app = "fizzy", .tools = .{ "commands.list", "commands.call", "ui.snapshot", "ui.settled", "ui.act", "ui.run", "tape.play", "tape.outcome", "profile.report" } }
     );
     if (eql(tool, "commands.list")) return listCommands(host, server, req, arena);
     if (eql(tool, "commands.call")) {
@@ -109,7 +108,8 @@ fn handle(host: *sdk.Host, server: *Server, req: *Server.Request) void {
         if (auto.settled()) return req.answer(server, true, "true");
         return wait(host, server, req, .{ .settled = now() + ms(a.timeout_ms) });
     }
-    if (eql(tool, "ui.act")) return act(host, server, req, auto, arena, source);
+    if (eql(tool, "ui.act")) return act(host, server, req, arena, source);
+    if (eql(tool, "ui.run")) return run(host, server, req, auto, source);
     if (eql(tool, "tape.play")) {
         return switch (auto.play(req.args)) {
             .started => |t| req.answer(server, true, std.fmt.allocPrint(arena, ".{{ .ticket = {d} }}", .{@intFromEnum(t)}) catch "?"),
@@ -165,35 +165,10 @@ fn check(host: *sdk.Host, server: *Server, w: *Waiting) bool {
             w.req.answer(server, true, "false");
             return true;
         },
-        .act => |a| {
-            const o = auto.outcome(a.tape);
-            if (o == .playing and now() < a.deadline) return later(host);
-            var buf: [64]u8 = undefined;
-            const text = if (o == .playing) blk: {
-                auto.stop(a.tape);
-                break :blk ".took_longer_than_timeout_ms";
-            } else outcomeText(&buf, o);
-            if (!a.snapshot) {
-                w.req.answer(server, true, text);
-                return true;
-            }
-            // Then the screen, as it was left.
-            const owned = host.allocator.dupe(u8, text) catch {
-                w.req.answer(server, true, text);
-                return true;
-            };
-            w.until = .{ .act_snapshot = .{ .outcome = owned, .shot = auto.snapshot() } };
-            return later(host);
-        },
-        .act_snapshot => |a| {
-            const screen = auto.snapshotText(a.shot) orelse return later(host);
-            defer host.allocator.free(a.outcome);
-            var out: std.Io.Writer.Allocating = .init(host.allocator);
-            defer out.deinit();
-            out.writer.print(".{{ .outcome = {s}, .screen = ", .{a.outcome}) catch {};
-            out.writer.writeAll(screen) catch {};
-            out.writer.writeAll("}\n") catch {};
-            w.req.answer(server, true, out.written());
+        .run => |r| {
+            const report = r.advance(host, auto) orelse return false;
+            w.req.answer(server, true, report);
+            r.deinit(host.allocator);
             return true;
         },
         .profile => |until| {
@@ -212,64 +187,35 @@ fn check(host: *sdk.Host, server: *Server, w: *Waiting) bool {
     }
 }
 
-/// `ui.act`'s steps, played as a live tape: a person's input, through the same widgets.
-const Step = union(enum) {
-    /// A tagged widget (`.tag`), or a point in the window in physical pixels (`.x`, `.y`, as a
-    /// snapshot's rects are).
-    click: Point,
-    double_click: Point,
-    move: Point,
-    type: []const u8,
-    /// A chord as the keymap spells it: "mod+s", "escape", "cmd+k cmd+s".
-    key: []const u8,
-    /// Hold until the tagged widget is drawn.
-    wait_for: []const u8,
-    /// Run a command with no arguments, as its menu row would (`commands.call` takes arguments).
-    command: []const u8,
-};
+/// `ui.run`: a script, run across frames, answered with one report (`Run.zig`).
+fn run(host: *sdk.Host, server: *Server, req: *Server.Request, auto: *Automation, source: [:0]const u8) void {
+    const r = Run.init(host.allocator, source) catch |err| return req.answer(server, false, switch (err) {
+        error.BadScript => "ui.run takes .{ .steps = .{ .{ .click = .{ .tag = \"...\" } }, .{ .call = .{ .id, .args } }, .{ .expect = .{ .tag } }, .{ .settle = .{} }, .{ .screen = .{} }, .{ .profile = .{ .ms } }, ... }, .timeout_ms }",
+        error.OutOfMemory => "out of memory",
+    });
+    if (r.advance(host, auto)) |report| {
+        req.answer(server, true, report);
+        return r.deinit(host.allocator);
+    }
+    wait(host, server, req, .{ .run = r });
+}
 
-const Point = struct {
-    tag: []const u8 = "",
-    x: ?f32 = null,
-    y: ?f32 = null,
-};
-
-fn act(host: *sdk.Host, server: *Server, req: *Server.Request, auto: *Automation, arena: std.mem.Allocator, source: [:0]const u8) void {
-    const Args = struct { steps: []const Step, snapshot: bool = true, timeout_ms: u32 = 10_000 };
+/// `ui.act`: input as a live tape, then the screen unless `snapshot` is false. A run of its
+/// steps, with `screen` after.
+fn act(host: *sdk.Host, server: *Server, req: *Server.Request, arena: std.mem.Allocator, source: [:0]const u8) void {
+    const Args = struct { steps: []const Run.Step, snapshot: bool = true, timeout_ms: u32 = 10_000 };
     const a = parse(Args, arena, source) orelse return req.answer(server, false,
         \\ui.act takes .{ .steps = .{ .{ .click = .{ .tag = "..." } }, .{ .type = "..." }, .{ .key = "mod+s" }, ... }, .snapshot = true }
     );
-    var s: Script = .init(arena, "agent", "");
-    s.check.live = true;
-    // Quicker than a demo's person, still slow enough to watch: the pointer is seen to travel.
-    s.pace = .{ .move_ms = 300, .hover_ms = 80, .click_ms = 60, .beat_ms = 150, .cps = 60 };
-    const win = dvui.windowRectPixels();
-    for (a.steps) |step| {
-        const ok = switch (step) {
-            .click => |p| s.click(target(p, win), .{}),
-            .double_click => |p| s.click(target(p, win), .{ .double = true }),
-            .move => |p| s.moveTo(target(p, win), .{}),
-            .type => |t| s.typeText(t, .{}),
-            .key => |k| s.key(k),
-            .wait_for => |tag| s.waitFor(tag, .{}),
-            .command => |id| s.command(id),
-        };
-        ok catch |err| return req.answer(server, false, @errorName(err));
-    }
-    // The script's memory is the request's arena: nothing to free here.
-    const owned = s.finish() catch |err| return req.answer(server, false, @errorName(err));
-    var bytes: std.Io.Writer.Allocating = .init(arena);
-    owned.tape.write(&bytes.writer) catch return req.answer(server, false, "could not write the tape");
-    switch (auto.play(bytes.written())) {
-        .started => |t| wait(host, server, req, .{ .act = .{ .tape = t, .deadline = now() + ms(a.timeout_ms), .snapshot = a.snapshot } }),
-        .busy => req.answer(server, false, "something else is driving fizzy: a tape or a demo"),
-        .invalid => |why| req.answer(server, false, why),
-    }
-}
-
-fn target(p: Point, win: dvui.Rect.Physical) @import("tape").Tape.Target {
-    if (p.tag.len > 0) return .{ .tag = p.tag };
-    return .{ .x = (p.x orelse 0) / @max(win.w, 1), .y = (p.y orelse 0) / @max(win.h, 1) };
+    var steps: std.ArrayListUnmanaged(Run.Step) = .empty;
+    steps.appendSlice(arena, a.steps) catch return req.answer(server, false, "out of memory");
+    if (a.snapshot) steps.append(arena, .{ .screen = .{} }) catch return req.answer(server, false, "out of memory");
+    var out: std.Io.Writer.Allocating = .init(arena);
+    std.zon.stringify.serialize(Run.Args{ .steps = steps.items, .timeout_ms = a.timeout_ms }, .{ .emit_default_optional_fields = false }, &out.writer) catch
+        return req.answer(server, false, "out of memory");
+    const zon = arena.dupeZ(u8, out.written()) catch return req.answer(server, false, "out of memory");
+    const auto = automation(host) orelse return req.answer(server, false, "this app offers no automation service");
+    run(host, server, req, auto, zon);
 }
 
 fn outcomeText(buf: []u8, o: Automation.Outcome) []const u8 {
