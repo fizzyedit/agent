@@ -8,8 +8,10 @@
 //! `hello` carrying the token from `connection.zon`, which the plugin writes beside the socket for
 //! a client to find; anything else first and the connection is closed.
 //!
-//! One connection at a time, and one request in flight on it: an agent waits for each answer
-//! anyway, and a second client waits for the first to go.
+//! Each connection has a thread of its own, so several clients are served at once: an agent in
+//! the chat panel holds its connection for the whole session, and an agent in a terminal must not
+//! wait for it. One request is in flight per connection (an agent waits for each answer anyway),
+//! and the UI thread answers them in the order they arrive.
 const Server = @This();
 
 const std = @import("std");
@@ -23,12 +25,18 @@ token: [32]u8,
 wake: *const fn () void,
 thread: ?std.Thread = null,
 listener: ?Io.net.Server = null,
-/// The connection being served, so `stop` can end a read that is waiting on it.
-current: ?Io.net.Stream = null,
+/// The connections being served, under `lock`, so `stop` can end their reads and wait for them.
+conns: std.ArrayListUnmanaged(*Conn) = .empty,
 stopping: std.atomic.Value(bool) = .init(false),
 /// Requests waiting for the UI thread, under `lock`.
 lock: Io.Mutex = .init,
 pending: std.ArrayListUnmanaged(*Request) = .empty,
+
+const Conn = struct {
+    stream: Io.net.Stream,
+    thread: ?std.Thread = null,
+    done: std.atomic.Value(bool) = .init(false),
+};
 
 pub const Wire = struct {
     pub const Request = struct {
@@ -84,7 +92,7 @@ pub fn stop(self: *Server) void {
         defer self.lock.unlock(self.io);
         for (self.pending.items) |r| r.answer(self, false, "fizzy is closing");
         self.pending.clearRetainingCapacity();
-        if (self.current) |s| s.shutdown(self.io, .both) catch {};
+        for (self.conns.items) |c| c.stream.shutdown(self.io, .both) catch {};
     }
     // A thread in `accept` wakes when someone connects: be that someone.
     if (Io.net.UnixAddress.init(self.socket_path)) |addr| {
@@ -92,6 +100,12 @@ pub fn stop(self: *Server) void {
     } else |_| {}
     if (self.thread) |t| t.join();
     self.thread = null;
+    // No more are accepted: wait for each connection's thread, its read ended above.
+    for (self.conns.items) |c| {
+        if (c.thread) |t| t.join();
+        self.gpa.destroy(c);
+    }
+    self.conns.deinit(self.gpa);
     if (self.listener) |*l| l.deinit(self.io);
     self.listener = null;
     Io.Dir.deleteFileAbsolute(self.io, self.socket_path) catch {};
@@ -107,18 +121,51 @@ fn run(self: *Server) void {
     };
     while (!self.stopping.load(.acquire)) {
         const stream = self.listener.?.accept(self.io) catch continue;
-        defer stream.close(self.io);
-        if (self.stopping.load(.acquire)) return;
-        self.setCurrent(stream);
-        defer self.setCurrent(null);
-        self.serve(stream);
+        if (self.stopping.load(.acquire)) {
+            stream.close(self.io);
+            return;
+        }
+        const conn = self.gpa.create(Conn) catch {
+            stream.close(self.io);
+            continue;
+        };
+        conn.* = .{ .stream = stream };
+        self.lock.lockUncancelable(self.io);
+        defer self.lock.unlock(self.io);
+        self.reap();
+        self.conns.append(self.gpa, conn) catch {
+            stream.close(self.io);
+            self.gpa.destroy(conn);
+            continue;
+        };
+        conn.thread = std.Thread.spawn(.{}, serveConn, .{ self, conn }) catch {
+            _ = self.conns.pop();
+            stream.close(self.io);
+            self.gpa.destroy(conn);
+            continue;
+        };
     }
 }
 
-fn setCurrent(self: *Server, stream: ?Io.net.Stream) void {
-    self.lock.lockUncancelable(self.io);
-    defer self.lock.unlock(self.io);
-    self.current = stream;
+fn serveConn(self: *Server, conn: *Conn) void {
+    self.serve(conn.stream);
+    conn.stream.close(self.io);
+    conn.done.store(true, .release);
+}
+
+/// Join and free connections whose clients have gone. Under `lock`.
+fn reap(self: *Server) void {
+    var i: usize = 0;
+    while (i < self.conns.items.len) {
+        const c = self.conns.items[i];
+        if (!c.done.load(.acquire)) {
+            i += 1;
+            continue;
+        }
+        if (c.thread) |t| t.join();
+        self.gpa.destroy(c);
+        _ = self.conns.swapRemove(i);
+    }
 }
 
 fn serve(self: *Server, stream: Io.net.Stream) void {
