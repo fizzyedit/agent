@@ -16,6 +16,12 @@ const std = @import("std");
 const Io = std.Io;
 const json = std.json;
 
+/// No stack dump for an errno std did not expect. Its Unix-socket connect has no
+/// `ConnectionRefused` (Zig 0.16), so a stale `agent.sock` with nothing listening (fizzy crashed)
+/// reaches `posix.unexpectedErrno`, which in Debug printed a trace on every call. The error itself
+/// still arrives, as `error.Unexpected`, and every caller here answers it.
+pub const std_options: std.Options = .{ .unexpected_error_tracing = false };
+
 const protocol_version = "2025-06-18";
 
 const Tool = struct {
