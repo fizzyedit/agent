@@ -245,7 +245,8 @@ fn checkOrFinish(self: *Build, host: *sdk.Host, auto: ?*Automation) ?[]const u8 
         return self.report.written();
     }
     var src: std.Io.Writer.Allocating = .init(self.arena.allocator());
-    std.zon.stringify.serialize(Run.Args{ .steps = self.args.check }, .{ .emit_default_optional_fields = false }, &src.writer) catch return self.fail("could not write the check");
+    // `Run.Step` nests (a `compare` holds steps), so the serializer is given a depth to stop at.
+    std.zon.stringify.serializeMaxDepth(Run.Args{ .steps = self.args.check }, .{ .emit_default_optional_fields = false }, &src.writer, 32) catch return self.fail("could not write the check");
     const zon = self.arena.allocator().dupeZ(u8, src.written()) catch return self.fail("out of memory");
     const r = Run.init(self.gpa, zon) catch return self.fail("the check is not a script ui.run takes");
     self.phase = .{ .checking = r };

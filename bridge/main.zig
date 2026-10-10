@@ -88,7 +88,11 @@ const tools = [_]Tool{
         \\  {"expect": {"tag": "...", "shown": true}}    fails the run if not so, now
         \\  {"settle": {}}                               wait until nothing is in flight
         \\  {"screen": {}}                               what is on screen, into the report
-        \\  {"profile": {"ms": 500}}                     the profiler's report for that long
+        \\  {"profile": {"ms": 500}}                     the profiler's report for that long: only the
+        \\                                               frames fizzy draws on its own (its .causes say
+        \\                                               why each came); "drive": true asks for every frame
+        \\  {"compare": {"ms": 500, "steps": [...]}}     measure, run the steps, measure again: the frame
+        \\                                               both times and the scopes that moved most
         \\The first step that fails ends the run; the report says which (failed_at) and why.
         \\Waits and settle give up after timeout_ms.
         ,
@@ -159,10 +163,12 @@ const tools = [_]Tool{
         .calls = "profile.report",
         .description =
         \\Measure fizzy for a while and answer the profiler's report: fps, frame work and its
-        \\worst, then time per plugin and per scope. Use it instead of adding logging.
+        \\worst, time per plugin and per scope, and why each frame came (.causes). Only the frames
+        \\fizzy draws on its own are measured; "drive": true asks for every frame, to measure what
+        \\drawing costs. Use it instead of adding logging.
         ,
         .schema =
-        \\{"type":"object","properties":{"ms":{"type":"integer","default":1000}}}
+        \\{"type":"object","properties":{"ms":{"type":"integer","default":1000},"drive":{"type":"boolean","default":false}}}
         ,
     },
     .{
@@ -485,20 +491,7 @@ pub const Bridge = struct {
                 .object => |o| o,
                 else => return .{ .err = "fizzy_run takes {\"steps\": [...]}" },
             };
-            const list = o.get("steps") orelse o.get("check");
-            if (list) |steps| if (steps == .array) for (steps.array.items) |*step| {
-                if (step.* != .object) continue;
-                const call_step = step.object.getPtr("call") orelse continue;
-                if (call_step.* != .object) continue;
-                const id = switch (call_step.object.get("id") orelse .null) {
-                    .string => |str| str,
-                    else => continue,
-                };
-                const args = call_step.object.get("args") orelse continue;
-                var inner: Io.Writer.Allocating = .init(arena);
-                toZon(&inner.writer, args, self.enumParams(arena, id)) catch return .{ .err = "out of memory" };
-                call_step.object.put(arena, "args", .{ .string = inner.written() }) catch return .{ .err = "out of memory" };
-            };
+            if (o.get("steps") orelse o.get("check")) |steps| self.callArgsToZon(arena, steps) catch return .{ .err = "out of memory" };
             toZon(&w.writer, arguments, &.{}) catch return .{ .err = "out of memory" };
             return .{ .ok = w.written() };
         }
@@ -514,6 +507,29 @@ pub const Bridge = struct {
         }
         toZon(&w.writer, arguments, &.{}) catch return .{ .err = "out of memory" };
         return .{ .ok = w.written() };
+    }
+
+    /// Each `call` step's args, a JSON object here, as ZON text for the plugin, its enum parameters
+    /// as literals (as for fizzy_call); inside a `compare` step's own steps too.
+    fn callArgsToZon(self: *Bridge, arena: std.mem.Allocator, steps: json.Value) !void {
+        if (steps != .array) return;
+        for (steps.array.items) |*step| {
+            if (step.* != .object) continue;
+            if (step.object.getPtr("compare")) |cmp| {
+                if (cmp.* == .object) if (cmp.object.get("steps")) |inner| try self.callArgsToZon(arena, inner);
+                continue;
+            }
+            const call_step = step.object.getPtr("call") orelse continue;
+            if (call_step.* != .object) continue;
+            const id = switch (call_step.object.get("id") orelse .null) {
+                .string => |str| str,
+                else => continue,
+            };
+            const args = call_step.object.get("args") orelse continue;
+            var inner: Io.Writer.Allocating = .init(arena);
+            try toZon(&inner.writer, args, self.enumParams(arena, id));
+            try call_step.object.put(arena, "args", .{ .string = inner.written() });
+        }
     }
 
     /// The keys of `id`'s enumeration parameters, from the command list. Empty when unknown.

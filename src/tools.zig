@@ -21,6 +21,7 @@ const dvui = @import("dvui");
 const core = @import("core");
 const Server = @import("Server.zig");
 const Run = @import("Run.zig");
+const measure = @import("measure.zig");
 const Build = @import("Build.zig");
 
 const Automation = sdk.services.automation.Api;
@@ -35,7 +36,7 @@ const Waiting = struct {
         settled: i96,
         run: *Run,
         build: *Build,
-        profile: i96,
+        profile: struct { until: i96, drive: bool },
     },
 };
 
@@ -147,11 +148,13 @@ fn handle(host: *sdk.Host, server: *Server, req: *Server.Request) void {
         return req.answer(server, true, outcomeText(&buf, auto.outcome(@enumFromInt(a.ticket))));
     }
     if (eql(tool, "profile.report")) {
-        const Args = struct { ms: u32 = 1000 };
+        // `drive`: ask for every frame, to measure what drawing costs; else only the frames fizzy
+        // draws on its own are measured (`measure.zig`).
+        const Args = struct { ms: u32 = 1000, drive: bool = false };
         const a = parse(Args, arena, source) orelse Args{};
         // A window of averages is half a second: ask for a little more than was asked.
         core.profile.want(a.ms + 600);
-        return wait(host, server, req, .{ .profile = now() + ms(a.ms + 600) });
+        return wait(host, server, req, .{ .profile = .{ .until = now() + ms(a.ms + 600), .drive = a.drive } });
     }
     req.answer(server, false, "no such tool (hello lists them)");
 }
@@ -206,9 +209,14 @@ fn check(host: *sdk.Host, server: *Server, w: *Waiting) bool {
             r.deinit(host.allocator);
             return true;
         },
-        .profile => |until| {
-            // Frames to measure: ask for them, as the profiler window's "Continuous" does.
-            if (now() < until) return later(host);
+        .profile => |wait_p| {
+            if (now() < wait_p.until) {
+                // Driving, every frame, as the profiler window's "Continuous" does; else one frame
+                // when the window ends, and whatever fizzy draws meanwhile.
+                if (wait_p.drive) return later(host);
+                measure.wakeAt(wait_p.until, now());
+                return false;
+            }
             const p = core.profile.current() orelse {
                 w.req.answer(server, false, "no profiler in this app");
                 return true;
@@ -246,7 +254,8 @@ fn act(host: *sdk.Host, server: *Server, req: *Server.Request, arena: std.mem.Al
     steps.appendSlice(arena, a.steps) catch return req.answer(server, false, "out of memory");
     if (a.snapshot) steps.append(arena, .{ .screen = .{} }) catch return req.answer(server, false, "out of memory");
     var out: std.Io.Writer.Allocating = .init(arena);
-    std.zon.stringify.serialize(Run.Args{ .steps = steps.items, .timeout_ms = a.timeout_ms }, .{ .emit_default_optional_fields = false }, &out.writer) catch
+    // `Run.Step` nests (a `compare` holds steps): the serializer is given a depth to stop at.
+    std.zon.stringify.serializeMaxDepth(Run.Args{ .steps = steps.items, .timeout_ms = a.timeout_ms }, .{ .emit_default_optional_fields = false }, &out.writer, 32) catch
         return req.answer(server, false, "out of memory");
     const zon = arena.dupeZ(u8, out.written()) catch return req.answer(server, false, "out of memory");
     const auto = automation(host) orelse return req.answer(server, false, "this app offers no automation service");

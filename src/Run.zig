@@ -7,7 +7,8 @@
 //! consecutive ones as one tape, so the person sees the pointer move and a click of theirs stops
 //! it. The rest run here, between tapes: `call` a command with arguments (its result goes in the
 //! report), `expect` a widget on screen or gone, `settle`, take the `screen`, `profile` for a
-//! while. The first step that fails ends the run, and the report says which and why.
+//! while, `compare` before and after some steps. The first step that fails ends the run, and the
+//! report says which and why.
 const Run = @This();
 
 const std = @import("std");
@@ -17,6 +18,7 @@ const core = @import("core");
 const Script = @import("tape").Script;
 const Tape = @import("tape").Tape;
 const anchor = @import("replay").anchor;
+const measure = @import("measure.zig");
 
 const Automation = sdk.services.automation.Api;
 
@@ -57,8 +59,12 @@ pub const Step = union(enum) {
     settle: struct {},
     /// What is on screen now, into the report.
     screen: struct {},
-    /// Measure this many milliseconds of frames; the profiler's report goes in the report.
-    profile: struct { ms: u32 = 1000 },
+    /// Measure this many milliseconds of frames; the profiler's report goes in the report. Only
+    /// the frames fizzy draws on its own, unless `drive` asks for every one (what drawing costs).
+    profile: struct { ms: u32 = 1000, drive: bool = false },
+    /// Measure, run `steps`, measure again: the frame both times, and the scopes whose own time
+    /// moved most. Driving frames by default, since a comparison needs them.
+    compare: struct { ms: u32 = 1000, drive: bool = true, steps: []const Step = &.{} },
 
     fn isTape(self: Step) bool {
         return switch (self) {
@@ -79,9 +85,20 @@ const Waiting = union(enum) {
     tape: struct { ticket: Automation.Ticket, last: usize, deadline: i96 },
     settle: i96,
     screen: Automation.SnapshotTicket,
-    profile: i96,
+    profile: struct { until: i96, drive: bool },
+    compare: *Compare,
     /// `expect`, until a frame drawn with anchors asked for has ended.
     anchors,
+};
+
+const Compare = struct {
+    phase: enum { before, steps, after },
+    until: i96,
+    ms: u32,
+    drive: bool,
+    steps: []const Step,
+    before: measure.Snapshot = .{},
+    run: ?*Run = null,
 };
 
 pub const Args = struct {
@@ -101,7 +118,16 @@ pub fn init(gpa: std.mem.Allocator, source: [:0]const u8) error{ BadScript, OutO
     return self;
 }
 
+/// A run of `steps` (borrowed: the caller keeps them alive), as `compare` runs its own.
+fn ofSteps(gpa: std.mem.Allocator, steps: []const Step, timeout_ms: u32) error{OutOfMemory}!*Run {
+    const self = try gpa.create(Run);
+    self.* = .{ .arena = .init(gpa), .steps = steps, .timeout_ms = timeout_ms, .report = .init(gpa) };
+    self.report.writer.writeAll(".{\n    .steps = .{\n") catch return error.OutOfMemory;
+    return self;
+}
+
 pub fn deinit(self: *Run, gpa: std.mem.Allocator) void {
+    if (self.waiting == .compare) if (self.waiting.compare.run) |r| r.deinit(gpa);
     self.report.deinit();
     self.arena.deinit();
     gpa.destroy(self);
@@ -135,7 +161,16 @@ pub fn advance(self: *Run, host: *sdk.Host, auto: *Automation) ?[]const u8 {
             continue;
         }
         if (!self.poll(host, auto)) {
-            host.refresh();
+            switch (self.waiting) {
+                // A measurement waits for the frames fizzy draws on its own, and for one when it
+                // ends; driving asks for every one.
+                .profile => |p| if (p.drive) host.refresh() else measure.wakeAt(p.until, now()),
+                .compare => |c| switch (c.phase) {
+                    .steps => {}, // its run asks for the frames it needs
+                    else => if (c.drive) host.refresh() else measure.wakeAt(c.until, now()),
+                },
+                else => host.refresh(),
+            }
             return null;
         }
         if (self.failed != null or self.at >= self.steps.len) return self.finish();
@@ -183,8 +218,52 @@ fn poll(self: *Run, host: *sdk.Host, auto: *Automation) bool {
             w.writeAll(" },\n") catch {};
             self.at += 1;
         },
-        .profile => |until| {
-            if (now() < until) return false;
+        .compare => |c| switch (c.phase) {
+            .before => {
+                if (now() < c.until) return false;
+                c.before = measure.Snapshot.take(self.arena.allocator());
+                c.run = ofSteps(self.arena.child_allocator, c.steps, self.timeout_ms) catch {
+                    self.fail("out of memory");
+                    return true;
+                };
+                c.phase = .steps;
+                // Into the steps this frame: nothing else would ask for the next one.
+                return self.poll(host, auto);
+            },
+            .steps => {
+                const r = c.run.?;
+                const inner = r.advance(host, auto) orelse return false;
+                if (r.failed != null) {
+                    w.print("        .{{ .step = {d}, .compare = .{{ .failed_in = ", .{self.at}) catch {};
+                    indented(w, inner);
+                    w.writeAll(" } },\n") catch {};
+                    self.failed = self.at;
+                    r.deinit(self.arena.child_allocator);
+                    c.run = null;
+                    self.at += 1;
+                    self.waiting = .none;
+                    return true;
+                }
+                r.deinit(self.arena.child_allocator);
+                c.run = null;
+                core.profile.want(c.ms + 600);
+                c.until = now() + ms(c.ms + 600);
+                c.phase = .after;
+                return false;
+            },
+            .after => {
+                if (now() < c.until) return false;
+                const after = measure.Snapshot.take(self.arena.allocator());
+                var out: std.Io.Writer.Allocating = .init(self.arena.allocator());
+                measure.writeCompare(&out.writer, self.arena.allocator(), c.before, after, 10, "") catch {};
+                w.print("        .{{ .step = {d}, .compare = ", .{self.at}) catch {};
+                indented(w, out.written());
+                w.writeAll(" },\n") catch {};
+                self.at += 1;
+            },
+        },
+        .profile => |wait_p| {
+            if (now() < wait_p.until) return false;
             w.print("        .{{ .step = {d}, .profile = ", .{self.at}) catch {};
             if (core.profile.current()) |p| {
                 var out: std.Io.Writer.Allocating = .init(self.arena.allocator());
@@ -196,7 +275,6 @@ fn poll(self: *Run, host: *sdk.Host, auto: *Automation) bool {
         },
     }
     self.waiting = .none;
-    _ = host;
     return true;
 }
 
@@ -247,7 +325,13 @@ fn begin(self: *Run, host: *sdk.Host, auto: *Automation) void {
         .profile => |p| {
             // A window of averages is half a second: a little more than asked.
             core.profile.want(p.ms + 600);
-            self.waiting = .{ .profile = now() + ms(p.ms + 600) };
+            self.waiting = .{ .profile = .{ .until = now() + ms(p.ms + 600), .drive = p.drive } };
+        },
+        .compare => |c| {
+            const cmp = self.arena.allocator().create(Compare) catch return self.fail("out of memory");
+            cmp.* = .{ .phase = .before, .until = now() + ms(c.ms + 600), .ms = c.ms, .drive = c.drive, .steps = c.steps };
+            core.profile.want(c.ms + 600);
+            self.waiting = .{ .compare = cmp };
         },
         else => unreachable,
     }
@@ -306,6 +390,14 @@ fn finish(self: *Run) []const u8 {
 
 /// `text` (ZON, maybe several lines) written as a nested value: its lines indented to sit inside
 /// the report.
+/// The step in progress fails with `why`, and the run ends.
+fn fail(self: *Run, why: []const u8) void {
+    self.report.writer.print("        .{{ .step = {d}, .failed = \"{s}\" }},\n", .{ self.at, why }) catch {};
+    self.failed = self.at;
+    self.at += 1;
+    self.waiting = .none;
+}
+
 fn indented(w: *std.Io.Writer, text: []const u8) void {
     var it = std.mem.splitScalar(u8, std.mem.trimEnd(u8, text, "\n"), '\n');
     var first = true;

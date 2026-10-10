@@ -23,7 +23,10 @@ server an agent (Claude Code, Codex, Grok's CLI, any MCP client) runs to reach i
   person uses, as a live tape. Everything shows on screen and lands in undo, and a person's own
   click stops it.
 - **The profiler on request.** `fizzy_profile` measures for a while and answers fps, frame
-  work, and time per plugin and per scope. Use it instead of adding logging.
+  work, time per plugin and per scope, and why each frame came. It measures only the frames
+  fizzy draws on its own, so an idle fizzy reads as idle; `drive` asks for every frame, to
+  measure what drawing costs. A script's `compare` step measures, runs its steps, measures again,
+  and answers what moved. Use it instead of adding logging.
 
 Nothing here is a back door: an agent can do what a person at the keyboard can, and no more.
 
