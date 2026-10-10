@@ -15,6 +15,7 @@
 const std = @import("std");
 const Io = std.Io;
 const json = std.json;
+const app_build = @import("app_build.zig");
 
 /// No stack dump for an errno std did not expect. Its Unix-socket connect has no
 /// `ConnectionRefused` (Zig 0.16), so a stale `agent.sock` with nothing listening (fizzy crashed)
@@ -106,10 +107,13 @@ const tools = [_]Tool{
         \\reload of the rebuilt binary (its timing, or why it failed), then an optional check:
         \\steps as fizzy_run takes them, run on what came back. The person's open documents stay
         \\open across the reload. Not for the agent plugin itself.
+        \\Given fizzy's own repo (or an app built on fizzy) instead: zig build there, then fizzy
+        \\restarting into the new executable (Settings > Restart when rebuilt), every document
+        \\kept; the report says how long it was gone, or that it did not come back.
         ,
         .schema =
         \\{"type":"object","properties":{
-        \\"path":{"type":"string","description":"the plugin's directory, absolute"},
+        \\"path":{"type":"string","description":"the plugin's directory, or the app's repo, absolute"},
         \\"optimize":{"type":"string","enum":["Debug","ReleaseSafe","ReleaseFast","ReleaseSmall"]},
         \\"check":{"type":"array","items":{"type":"object"}},
         \\"timeout_ms":{"type":"integer","default":120000}},"required":["path"]}
@@ -211,6 +215,7 @@ pub fn main(init: std.process.Init) !void {
         .connection_path = try connectionPath(init.arena.allocator(), init.environ_map, profile),
     };
     defer bridge.disconnect();
+    defer if (bridge.hello) |h| gpa.free(h);
 
     var in_buf: [1 << 16]u8 = undefined;
     var out_buf: [1 << 16]u8 = undefined;
@@ -248,12 +253,14 @@ fn connectionPath(arena: std.mem.Allocator, env: *const std.process.Environ.Map,
     return std.fs.path.join(arena, &.{ base, "fizzy", tail[0], tail[1], tail[2] });
 }
 
-const Bridge = struct {
+pub const Bridge = struct {
     gpa: std.mem.Allocator,
     io: Io,
     connection_path: []const u8,
     link: ?*Link = null,
     next_id: u64 = 1,
+    /// What fizzy said to the last `hello`: its tools and the executable it runs from. Owned.
+    hello: ?[]u8 = null,
 
     /// A connection to the plugin, said hello on.
     const Link = struct {
@@ -269,7 +276,7 @@ const Bridge = struct {
         const Response = struct { id: u64, ok: ?[]const u8 = null, err: ?[]const u8 = null };
     };
 
-    const Answer = union(enum) { ok: []const u8, err: []const u8 };
+    pub const Answer = union(enum) { ok: []const u8, err: []const u8 };
 
     fn disconnect(self: *Bridge) void {
         const link = self.link orelse return;
@@ -294,13 +301,66 @@ const Bridge = struct {
         var hello: std.Io.Writer.Allocating = .init(arena);
         try std.zon.stringify.serialize(.{ .token = c.token }, .{ .whitespace = false }, &hello.writer);
         return switch (try self.exchange(arena, "hello", hello.written())) {
-            .ok => |s| s,
+            .ok => |s| {
+                self.keepHello(s);
+                return s;
+            },
             .err => |e| {
                 self.disconnect();
                 std.log.err("fizzy-mcp: fizzy refused the connection: {s}", .{e});
                 return error.Refused;
             },
         };
+    }
+
+    fn keepHello(self: *Bridge, answer: []const u8) void {
+        if (self.hello) |h| self.gpa.free(h);
+        self.hello = self.gpa.dupe(u8, answer) catch null;
+    }
+
+    /// Whether the fizzy this bridge is connected to still answers. A fizzy quitting closes the
+    /// connection, so this is false once it has gone (and the link is dropped).
+    pub fn probe(self: *Bridge, arena: std.mem.Allocator) bool {
+        if (self.link == null) return false;
+        const answer = self.exchange(arena, "hello", "") catch {
+            self.disconnect();
+            return false;
+        };
+        switch (answer) {
+            .ok => |s| self.keepHello(s),
+            .err => {},
+        }
+        return true;
+    }
+
+    /// Connect afresh: to the fizzy `connection.zon` names now.
+    pub fn reconnect(self: *Bridge, arena: std.mem.Allocator) bool {
+        self.disconnect();
+        _ = self.connect(arena) catch return false;
+        return true;
+    }
+
+    /// The executable the fizzy answering now runs from, or null when none is running.
+    pub fn executable(self: *Bridge, arena: std.mem.Allocator) ?[]const u8 {
+        if (!self.probe(arena)) {
+            if (!self.reconnect(arena)) return null;
+        }
+        const source = arena.dupeZ(u8, self.hello orelse return null) catch return null;
+        const Hello = struct { executable: []const u8 = "" };
+        const h = std.zon.parse.fromSliceAlloc(Hello, arena, source, null, .{ .ignore_unknown_fields = true }) catch return null;
+        return if (h.executable.len > 0) h.executable else null;
+    }
+
+    /// The token `connection.zon` holds now: a new one is a new fizzy.
+    pub fn connectionToken(self: *Bridge, arena: std.mem.Allocator) ?[]const u8 {
+        const source = Io.Dir.cwd().readFileAllocOptions(self.io, self.connection_path, arena, .limited(64 * 1024), .of(u8), 0) catch return null;
+        const c = std.zon.parse.fromSliceAlloc(struct { token: []const u8 }, arena, source, null, .{ .ignore_unknown_fields = true }) catch return null;
+        return c.token;
+    }
+
+    pub fn runTool() Tool {
+        for (tools) |t| if (eql(t.calls, "ui.run")) return t;
+        unreachable;
     }
 
     /// One request and its answer, on the open link.
@@ -320,7 +380,7 @@ const Bridge = struct {
     }
 
     /// A tool call to fizzy, connecting first if need be, and once more if fizzy went away since.
-    fn call(self: *Bridge, arena: std.mem.Allocator, tool: []const u8, args: []const u8) Answer {
+    pub fn call(self: *Bridge, arena: std.mem.Allocator, tool: []const u8, args: []const u8) Answer {
         for (0..2) |_| {
             if (self.link == null) _ = self.connect(arena) catch |err| return .{ .err = switch (err) {
                 error.FizzyNotRunning => "fizzy is not running, or its agent plugin is not loaded (no connection.zon, or nothing listening on its socket)",
@@ -380,7 +440,9 @@ const Bridge = struct {
                 if (eql(t.name, name)) break t;
             } else return reply(out, id, .{ .@"error" = .{ .code = -32602, .message = "no such tool" } });
             const arguments: json.Value = p.get("arguments") orelse .{ .object = .{} };
-            const answer = switch (self.toolArgs(arena, tool, arguments)) {
+            const answer = if (appBuildArgs(self.io, tool, arguments)) |a|
+                app_build.run(self, arena, a)
+            else switch (self.toolArgs(arena, tool, arguments)) {
                 .ok => |zon_args| self.call(arena, tool.calls, zon_args),
                 .err => |e| Answer{ .err = e },
             };
@@ -397,7 +459,7 @@ const Bridge = struct {
     }
 
     /// The plugin's arguments, as ZON, from the MCP call's JSON.
-    fn toolArgs(self: *Bridge, arena: std.mem.Allocator, tool: Tool, arguments: json.Value) Answer {
+    pub fn toolArgs(self: *Bridge, arena: std.mem.Allocator, tool: Tool, arguments: json.Value) Answer {
         var w: Io.Writer.Allocating = .init(arena);
         if (eql(tool.calls, "commands.call")) {
             const o = switch (arguments) {
@@ -475,6 +537,31 @@ const Bridge = struct {
         return &.{};
     }
 };
+
+/// `fizzy_build`'s arguments when its path is an app's repo (fizzy's own, or an app on fizzy)
+/// rather than a plugin's: built and restarted into here, since the plugin goes with the old
+/// fizzy (`app_build.zig`). Null for every other call.
+fn appBuildArgs(io: Io, tool: Tool, arguments: json.Value) ?app_build.Args {
+    if (!eql(tool.calls, "plugin.build") or arguments != .object) return null;
+    const o = arguments.object;
+    const path = switch (o.get("path") orelse return null) {
+        .string => |s| s,
+        else => return null,
+    };
+    if (!app_build.isApp(io, path)) return null;
+    return .{
+        .path = path,
+        .optimize = if (o.get("optimize")) |v| switch (v) {
+            .string => |s| s,
+            else => "",
+        } else "",
+        .check = o.get("check"),
+        .timeout_ms = if (o.get("timeout_ms")) |v| switch (v) {
+            .integer => |n| @intCast(@max(n, 1000)),
+            else => 120_000,
+        } else 120_000,
+    };
+}
 
 const instructions =
     \\fizzy is a native editor whose every feature is a plugin. These tools drive a running fizzy

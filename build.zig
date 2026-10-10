@@ -16,12 +16,19 @@ pub fn build(b: *std.Build) void {
     fizzy.plugin.install(b, plugin.lib, .{});
 
     // std-only: it relays between an MCP client on stdio and the plugin's socket.
+    // The compiler's diagnostics, read the same way by the plugin's build loop and the bridge's.
+    const diagnostics_module = b.createModule(.{
+        .target = target,
+        .optimize = optimize,
+        .root_source_file = b.path("src/diagnostics.zig"),
+    });
     const bridge = b.addExecutable(.{
         .name = "fizzy-mcp",
         .root_module = b.createModule(.{
             .target = target,
             .optimize = optimize,
             .root_source_file = b.path("bridge/main.zig"),
+            .imports = &.{.{ .name = "diagnostics", .module = diagnostics_module }},
         }),
     });
     b.installArtifact(bridge);
@@ -42,6 +49,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
         .root_source_file = b.path("bridge/main.zig"),
+        .imports = &.{.{ .name = "diagnostics", .module = diagnostics_module }},
     }) });
     const diagnostics = b.addTest(.{ .root_module = b.createModule(.{
         .target = target,

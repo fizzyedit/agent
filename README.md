@@ -14,6 +14,11 @@ server an agent (Claude Code, Codex, Grok's CLI, any MCP client) runs to reach i
 - **Build, reload, check: one call.** `fizzy_build` builds a plugin's directory, answers
   compile errors as data (file, line, column, message), waits for fizzy to reload the rebuilt
   binary, and runs a `fizzy_run` script against it. A warm loop is about a second.
+- **The build loop in one call.** `fizzy_build` builds a plugin, answers the compiler's errors as
+  file, line and message, waits for fizzy to reload it, and runs a check script on what came
+  back. Given fizzy's own repo instead, it builds fizzy and waits for the running fizzy to restart
+  into the new executable (Settings > Restart when rebuilt), every open document kept, then runs
+  the check there. The bridge does that half, since the plugin goes with the old fizzy.
 - **Input as a person's.** `fizzy_act` clicks, types and presses keys through the same widgets a
   person uses, as a live tape. Everything shows on screen and lands in undo, and a person's own
   click stops it.

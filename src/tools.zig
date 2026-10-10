@@ -7,7 +7,7 @@
 //!
 //! | tool | arguments | result |
 //! |---|---|---|
-//! | `hello` | `.{ .token }` | the tools, and what fizzy offers |
+//! | `hello` | `.{ .token }` | the tools, what fizzy offers, and the executable it runs from |
 //! | `commands.list` | — | every command: id, title, enabled, parameters (kind, description, default) |
 //! | `commands.call` | `.{ .id, .args = "<ZON>" }` | its result, or why not |
 //! | `ui.snapshot` | — | what is on screen (`automation` service): role, name, tag, rect, parent |
@@ -86,9 +86,19 @@ fn handle(host: *sdk.Host, server: *Server, req: *Server.Request) void {
     const source = arena.dupeZ(u8, req.args) catch return req.answer(server, false, "out of memory");
     const tool = req.tool;
 
-    if (eql(tool, "hello")) return req.answer(server, true,
-        \\.{ .app = "fizzy", .tools = .{ "commands.list", "commands.call", "ui.snapshot", "ui.settled", "ui.act", "ui.run", "plugin.build", "tape.play", "tape.outcome", "profile.report" } }
-    );
+    if (eql(tool, "hello")) {
+        // The executable this fizzy runs from: the bridge compares it across an app build to tell
+        // whether fizzy will restart into a new one (`fizzy_build` on an app's repo).
+        var buf: [std.fs.max_path_bytes]u8 = undefined;
+        const n = std.process.executablePath(dvui.io, &buf) catch 0;
+        var w: std.Io.Writer.Allocating = .init(arena);
+        std.zon.stringify.serialize(.{
+            .app = "fizzy",
+            .executable = buf[0..n],
+            .tools = .{ "commands.list", "commands.call", "ui.snapshot", "ui.settled", "ui.act", "ui.run", "plugin.build", "tape.play", "tape.outcome", "profile.report" },
+        }, .{ .whitespace = false }, &w.writer) catch return req.answer(server, false, "out of memory");
+        return req.answer(server, true, w.written());
+    }
     if (eql(tool, "commands.list")) return listCommands(host, server, req, arena);
     if (eql(tool, "commands.call")) {
         const a = parse(struct { id: []const u8, args: []const u8 = "" }, arena, source) orelse
