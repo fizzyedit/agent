@@ -12,6 +12,7 @@ pub fn build(b: *std.Build) void {
     // `core` was built with, from the same dependency instance `create` used.
     const sdk = b.dependency("fizzy", .{ .target = target, .optimize = optimize, .plugin_sdk = true });
     plugin.module.addImport("tape", sdk.module("tape"));
+    plugin.module.addImport("replay", sdk.module("replay"));
     fizzy.plugin.install(b, plugin.lib, .{});
 
     // std-only: it relays between an MCP client on stdio and the plugin's socket.

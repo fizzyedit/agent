@@ -16,6 +16,7 @@ const dvui = @import("dvui");
 const core = @import("core");
 const Script = @import("tape").Script;
 const Tape = @import("tape").Tape;
+const anchor = @import("replay").anchor;
 
 const Automation = sdk.services.automation.Api;
 
@@ -30,6 +31,10 @@ at: usize = 0,
 waiting: Waiting = .none,
 report: std.Io.Writer.Allocating,
 failed: ?usize = null,
+/// The frame the run last asked for anchors in (`advance`, by `frame_time_ns`). Tags built from
+/// data (a rail's views, a tab's path) are only named in a frame someone asked for them in, and
+/// `expect` reads the frame just drawn, so it holds until that frame is an earlier one.
+asked_anchors_at: ?i128 = null,
 
 pub const Step = union(enum) {
     /// A tagged widget, or a point in the window in physical pixels (as a snapshot's rects are).
@@ -75,6 +80,8 @@ const Waiting = union(enum) {
     settle: i96,
     screen: Automation.SnapshotTicket,
     profile: i96,
+    /// `expect`, until a frame drawn with anchors asked for has ended.
+    anchors,
 };
 
 pub const Args = struct {
@@ -111,7 +118,22 @@ fn ms(n: u32) i96 {
 /// Go as far as this frame allows. The finished report (owned by the run) once done, else null:
 /// call again next frame, which `host.refresh` makes sure there is.
 pub fn advance(self: *Run, host: *sdk.Host, auto: *Automation) ?[]const u8 {
+    // Called before anything draws in each frame of the run (the plugin's `beginFrame`), and
+    // perhaps twice in one: the frame a run arrives in starts it too.
+    const frame = dvui.currentWindow().frame_time_ns;
+    const anchored = if (self.asked_anchors_at) |at| at != frame else false;
+    anchor.want();
+    self.asked_anchors_at = frame;
     while (true) {
+        if (self.waiting == .anchors) {
+            if (!anchored) {
+                host.refresh();
+                return null;
+            }
+            self.waiting = .none;
+            self.expect(self.steps[self.at].expect);
+            continue;
+        }
         if (!self.poll(host, auto)) {
             host.refresh();
             return null;
@@ -125,7 +147,7 @@ pub fn advance(self: *Run, host: *sdk.Host, auto: *Automation) ?[]const u8 {
 fn poll(self: *Run, host: *sdk.Host, auto: *Automation) bool {
     const w = &self.report.writer;
     switch (self.waiting) {
-        .none => return true,
+        .none, .anchors => return true,
         .tape => |t| {
             const o = auto.outcome(t.ticket);
             if (o == .playing and now() < t.deadline) return false;
@@ -219,13 +241,7 @@ fn begin(self: *Run, host: *sdk.Host, auto: *Automation) void {
             }
             self.at += 1;
         },
-        .expect => |e| {
-            const shown = if (dvui.tagGet(e.tag)) |td| td.visible else false;
-            const holds = shown == e.shown;
-            w.print("        .{{ .step = {d}, .expect = \"{s}\", .shown = {}, .holds = {} }},\n", .{ self.at, e.tag, shown, holds }) catch {};
-            if (!holds) self.failed = self.at;
-            self.at += 1;
-        },
+        .expect => self.waiting = .anchors,
         .settle => self.waiting = .{ .settle = now() + ms(self.timeout_ms) },
         .screen => self.waiting = .{ .screen = auto.snapshot() },
         .profile => |p| {
@@ -235,6 +251,14 @@ fn begin(self: *Run, host: *sdk.Host, auto: *Automation) void {
         },
         else => unreachable,
     }
+}
+
+fn expect(self: *Run, e: @FieldType(Step, "expect")) void {
+    const shown = if (dvui.tagGet(e.tag)) |td| td.visible else false;
+    const holds = shown == e.shown;
+    self.report.writer.print("        .{{ .step = {d}, .expect = \"{s}\", .shown = {}, .holds = {} }},\n", .{ self.at, e.tag, shown, holds }) catch {};
+    if (!holds) self.failed = self.at;
+    self.at += 1;
 }
 
 /// Steps as one live tape, played now. Quick enough to watch: the pointer is seen to travel.
