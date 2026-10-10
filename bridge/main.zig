@@ -92,6 +92,24 @@ const tools = [_]Tool{
         ,
     },
     .{
+        .name = "fizzy_build",
+        .calls = "plugin.build",
+        .description =
+        \\Build a plugin and see it running, in one call: zig build in its directory (installing
+        \\into this fizzy), the compiler's errors as file, line, column and message, then fizzy's
+        \\reload of the rebuilt binary (its timing, or why it failed), then an optional check:
+        \\steps as fizzy_run takes them, run on what came back. The person's open documents stay
+        \\open across the reload. Not for the agent plugin itself.
+        ,
+        .schema =
+        \\{"type":"object","properties":{
+        \\"path":{"type":"string","description":"the plugin's directory, absolute"},
+        \\"optimize":{"type":"string","enum":["Debug","ReleaseSafe","ReleaseFast","ReleaseSmall"]},
+        \\"check":{"type":"array","items":{"type":"object"}},
+        \\"timeout_ms":{"type":"integer","default":120000}},"required":["path"]}
+        ,
+    },
+    .{
         .name = "fizzy_commands",
         .calls = "commands.list",
         .description =
@@ -392,14 +410,15 @@ const Bridge = struct {
             std.zon.stringify.serialize(.{ .id = id, .args = inner.written() }, .{ .whitespace = false }, &w.writer) catch return .{ .err = "out of memory" };
             return .{ .ok = w.written() };
         }
-        if (eql(tool.calls, "ui.run")) {
+        if (eql(tool.calls, "ui.run") or eql(tool.calls, "plugin.build")) {
             // A `call` step's args are a JSON object here and ZON text for the plugin, its enum
             // parameters as literals (as for fizzy_call).
             const o = switch (arguments) {
                 .object => |o| o,
                 else => return .{ .err = "fizzy_run takes {\"steps\": [...]}" },
             };
-            if (o.get("steps")) |steps| if (steps == .array) for (steps.array.items) |*step| {
+            const list = o.get("steps") orelse o.get("check");
+            if (list) |steps| if (steps == .array) for (steps.array.items) |*step| {
                 if (step.* != .object) continue;
                 const call_step = step.object.getPtr("call") orelse continue;
                 if (call_step.* != .object) continue;

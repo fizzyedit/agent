@@ -42,7 +42,14 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .root_source_file = b.path("bridge/main.zig"),
     }) });
-    b.step("test", "Run the bridge's tests").dependOn(&b.addRunArtifact(tests).step);
+    const diagnostics = b.addTest(.{ .root_module = b.createModule(.{
+        .target = target,
+        .optimize = optimize,
+        .root_source_file = b.path("src/diagnostics.zig"),
+    }) });
+    const test_step = b.step("test", "Run the std-only tests: the bridge's, and reading compiler diagnostics");
+    test_step.dependOn(&b.addRunArtifact(tests).step);
+    test_step.dependOn(&b.addRunArtifact(diagnostics).step);
 }
 
 /// Copies `fizzy-mcp` into `<plugins>/agent/`, the directory `fizzy.plugin.install` puts the

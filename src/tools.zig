@@ -21,6 +21,7 @@ const dvui = @import("dvui");
 const core = @import("core");
 const Server = @import("Server.zig");
 const Run = @import("Run.zig");
+const Build = @import("Build.zig");
 
 const Automation = sdk.services.automation.Api;
 
@@ -33,6 +34,7 @@ const Waiting = struct {
         snapshot: Automation.SnapshotTicket,
         settled: i96,
         run: *Run,
+        build: *Build,
         profile: i96,
     },
 };
@@ -65,6 +67,7 @@ pub fn deinit(host: *sdk.Host, server: *Server) void {
     for (waiting.items) |w| {
         switch (w.until) {
             .run => |r| r.deinit(host.allocator),
+            .build => |b| b.deinit(),
             else => {},
         }
         w.req.answer(server, false, "fizzy is closing");
@@ -84,7 +87,7 @@ fn handle(host: *sdk.Host, server: *Server, req: *Server.Request) void {
     const tool = req.tool;
 
     if (eql(tool, "hello")) return req.answer(server, true,
-        \\.{ .app = "fizzy", .tools = .{ "commands.list", "commands.call", "ui.snapshot", "ui.settled", "ui.act", "ui.run", "tape.play", "tape.outcome", "profile.report" } }
+        \\.{ .app = "fizzy", .tools = .{ "commands.list", "commands.call", "ui.snapshot", "ui.settled", "ui.act", "ui.run", "plugin.build", "tape.play", "tape.outcome", "profile.report" } }
     );
     if (eql(tool, "commands.list")) return listCommands(host, server, req, arena);
     if (eql(tool, "commands.call")) {
@@ -110,6 +113,17 @@ fn handle(host: *sdk.Host, server: *Server, req: *Server.Request) void {
     }
     if (eql(tool, "ui.act")) return act(host, server, req, arena, source);
     if (eql(tool, "ui.run")) return run(host, server, req, auto, source);
+    if (eql(tool, "plugin.build")) {
+        const plugins = host.getServiceTyped(sdk.services.plugins.Api) orelse return req.answer(server, false, "this app offers no plugins service (fizzy's SDK 0.2.22 or later)");
+        const b = Build.start(host.allocator, host, plugins, source) catch |err| return req.answer(server, false, switch (err) {
+            error.BadArguments => "plugin.build takes .{ .path = \"<plugin directory>\", .optimize, .check = .{ <ui.run steps> }, .timeout_ms }",
+            error.PathNotAbsolute => "give the plugin's directory as an absolute path",
+            error.NoPluginZon => "no plugin.zig.zon with an id in that directory",
+            error.CannotBuildItself => "the agent plugin cannot rebuild itself: its reload would end this request",
+            else => @errorName(err),
+        });
+        return wait(host, server, req, .{ .build = b });
+    }
     if (eql(tool, "tape.play")) {
         return switch (auto.play(req.args)) {
             .started => |t| req.answer(server, true, std.fmt.allocPrint(arena, ".{{ .ticket = {d} }}", .{@intFromEnum(t)}) catch "?"),
@@ -163,6 +177,17 @@ fn check(host: *sdk.Host, server: *Server, w: *Waiting) bool {
             }
             if (now() < deadline) return false;
             w.req.answer(server, true, "false");
+            return true;
+        },
+        .build => |b| {
+            const plugins = host.getServiceTyped(sdk.services.plugins.Api) orelse {
+                w.req.answer(server, false, "the plugins service went away");
+                b.deinit();
+                return true;
+            };
+            const report = b.advance(host, plugins, auto) orelse return false;
+            w.req.answer(server, true, report);
+            b.deinit();
             return true;
         },
         .run => |r| {

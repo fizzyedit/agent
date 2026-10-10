@@ -11,6 +11,9 @@ server an agent (Claude Code, Codex, Grok's CLI, any MCP client) runs to reach i
   waits, expectations, settling, the screen, the profiler) across fizzy's frames and answers one
   report, with the step that failed and why. Turns are what an agent's iteration costs; a check
   that took six calls takes one.
+- **Build, reload, check: one call.** `fizzy_build` builds a plugin's directory, answers
+  compile errors as data (file, line, column, message), waits for fizzy to reload the rebuilt
+  binary, and runs a `fizzy_run` script against it. A warm loop is about a second.
 - **Input as a person's.** `fizzy_act` clicks, types and presses keys through the same widgets a
   person uses, as a live tape. Everything shows on screen and lands in undo, and a person's own
   click stops it.
