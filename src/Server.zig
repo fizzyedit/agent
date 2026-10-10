@@ -15,6 +15,7 @@
 const Server = @This();
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Io = std.Io;
 
 gpa: std.mem.Allocator,
@@ -28,6 +29,14 @@ listener: ?Io.net.Server = null,
 /// The connections being served, under `lock`, so `stop` can end their reads and wait for them.
 conns: std.ArrayListUnmanaged(*Conn) = .empty,
 stopping: std.atomic.Value(bool) = .init(false),
+/// A pipe `stop` writes to, which wakes the thread waiting to accept (`run`). Waking it by
+/// connecting to the socket's path reaches whoever listens there now, which is not always this
+/// server: a fizzy taking over from this one (a restart's handover, on the same profile) has made
+/// the path its own. Not on Windows, which keeps connecting.
+wake_pipe: [2]std.c.fd_t = .{ -1, -1 },
+/// The socket file this server made, by inode: `stop` removes the path only while it is still this
+/// one, not the socket a fizzy taking over has made there since.
+socket_inode: ?std.Io.File.INode = null,
 /// Requests waiting for the UI thread, under `lock`.
 lock: Io.Mutex = .init,
 pending: std.ArrayListUnmanaged(*Request) = .empty,
@@ -96,12 +105,19 @@ pub fn stop(self: *Server) void {
         // shutting down a closed descriptor is a panic in std, not an error.
         for (self.conns.items) |c| if (!c.done.load(.acquire)) c.stream.shutdown(self.io, .both) catch {};
     }
-    // A thread in `accept` wakes when someone connects: be that someone.
-    if (Io.net.UnixAddress.init(self.socket_path)) |addr| {
+    // Wake the thread waiting to accept.
+    if (self.wake_pipe[1] >= 0) {
+        _ = std.c.write(self.wake_pipe[1], "x", 1);
+    } else if (Io.net.UnixAddress.init(self.socket_path)) |addr| {
+        // No pipe: a thread in `accept` wakes when someone connects, so be that someone.
         if (addr.connect(self.io)) |s| s.close(self.io) else |_| {}
     } else |_| {}
     if (self.thread) |t| t.join();
     self.thread = null;
+    for (&self.wake_pipe) |*fd| if (fd.* >= 0) {
+        _ = std.c.close(fd.*);
+        fd.* = -1;
+    };
     // No more are accepted: wait for each connection's thread, its read ended above.
     for (self.conns.items) |c| {
         if (c.thread) |t| t.join();
@@ -110,7 +126,11 @@ pub fn stop(self: *Server) void {
     self.conns.deinit(self.gpa);
     if (self.listener) |*l| l.deinit(self.io);
     self.listener = null;
-    Io.Dir.deleteFileAbsolute(self.io, self.socket_path) catch {};
+    if (self.socket_inode) |ours| {
+        if (Io.Dir.cwd().statFile(self.io, self.socket_path, .{})) |st| {
+            if (st.inode == ours) Io.Dir.deleteFileAbsolute(self.io, self.socket_path) catch {};
+        } else |_| {}
+    }
     self.pending.deinit(self.gpa);
 }
 
@@ -121,7 +141,20 @@ fn run(self: *Server) void {
         std.log.err("agent: could not listen on {s}: {t}", .{ self.socket_path, err });
         return;
     };
+    if (Io.Dir.cwd().statFile(self.io, self.socket_path, .{})) |st| self.socket_inode = st.inode else |_| {}
+    if (comptime builtin.os.tag != .windows) {
+        if (std.c.pipe(&self.wake_pipe) != 0) self.wake_pipe = .{ -1, -1 };
+    }
     while (!self.stopping.load(.acquire)) {
+        if (self.wake_pipe[0] >= 0) {
+            // Until someone connects, or `stop` writes to the pipe.
+            var fds = [_]std.posix.pollfd{
+                .{ .fd = self.listener.?.socket.handle, .events = std.posix.POLL.IN, .revents = 0 },
+                .{ .fd = self.wake_pipe[0], .events = std.posix.POLL.IN, .revents = 0 },
+            };
+            _ = std.posix.poll(&fds, -1) catch continue;
+            if (fds[1].revents != 0 or self.stopping.load(.acquire)) return;
+        }
         const stream = self.listener.?.accept(self.io) catch continue;
         if (self.stopping.load(.acquire)) {
             stream.close(self.io);
