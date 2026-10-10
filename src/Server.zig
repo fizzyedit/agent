@@ -92,7 +92,9 @@ pub fn stop(self: *Server) void {
         defer self.lock.unlock(self.io);
         for (self.pending.items) |r| r.answer(self, false, "fizzy is closing");
         self.pending.clearRetainingCapacity();
-        for (self.conns.items) |c| c.stream.shutdown(self.io, .both) catch {};
+        // Only the ones still open: a finished connection's socket is closed already, and
+        // shutting down a closed descriptor is a panic in std, not an error.
+        for (self.conns.items) |c| if (!c.done.load(.acquire)) c.stream.shutdown(self.io, .both) catch {};
     }
     // A thread in `accept` wakes when someone connects: be that someone.
     if (Io.net.UnixAddress.init(self.socket_path)) |addr| {
@@ -149,6 +151,9 @@ fn run(self: *Server) void {
 
 fn serveConn(self: *Server, conn: *Conn) void {
     self.serve(conn.stream);
+    // Closed under `lock`, with `done`, so `stop` never shuts down a descriptor already closed.
+    self.lock.lockUncancelable(self.io);
+    defer self.lock.unlock(self.io);
     conn.stream.close(self.io);
     conn.done.store(true, .release);
 }
