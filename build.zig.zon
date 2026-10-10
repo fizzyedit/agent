@@ -6,9 +6,12 @@
     .fingerprint = 0x268b9c9dc0289c64,
     .dependencies = .{
         .fizzy = .{
-            // Developed against fizzy's unreleased SDK (commands with arguments, the automation
-            // service's snapshot, the profiler's report): a local workspace until those ship.
-            .path = "../../fizzy-agent-sdk/sdk",
+            // The published SDK, not a path into a checkout: a release has to build from a
+            // clean clone, and the release asset (never the tag's git archive) is the SDK
+            // package alone. To build against a local fizzy instead:
+            // `zig build --fork=<fizzy checkout>/sdk`.
+            .url = "https://github.com/fizzyedit/fizzy/releases/download/sdk-v0.2.20/fizzy-sdk-v0.2.20.tar.gz",
+            .hash = "fizzy-0.2.20-SGBwY7BcIQAqHKHzaj0vwADkUQNdpiap19SmKZ29Rp0W",
         },
     },
 }
