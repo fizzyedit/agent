@@ -2,6 +2,6 @@
     .id = "agent",
     .name = "Agent",
     .version = "0.1.0",
-    .min_sdk_version = "0.2.23",
+    .min_sdk_version = "0.2.24",
     .description = "Lets an AI agent drive fizzy as a person does: its commands as tools, the screen as text, input through live tapes, the profiler on request. Pair it with fizzy-mcp.",
 }

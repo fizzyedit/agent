@@ -52,6 +52,20 @@ const tools = [_]Tool{
         ,
     },
     .{
+        .name = "fizzy_capture",
+        .calls = "ui.capture",
+        .description =
+        \\A picture of fizzy's window as fizzy drew it, from its own frame: works with the window
+        \\hidden, on another Space or covered, and moves nothing on the person's screen. What the
+        \\OS draws over or behind the window (its glass, Liquid Glass) is not in it: transparent.
+        \\Answers the image, and the path of the PNG written ("path": absolute; beside the
+        \\plugin's connection file when left out).
+        ,
+        .schema =
+        \\{"type":"object","properties":{"path":{"type":"string"}}}
+        ,
+    },
+    .{
         .name = "fizzy_act",
         .calls = "ui.act",
         .description =
@@ -447,6 +461,7 @@ pub const Bridge = struct {
                 if (eql(t.name, name)) break t;
             } else return reply(out, id, .{ .@"error" = .{ .code = -32602, .message = "no such tool" } });
             const arguments: json.Value = p.get("arguments") orelse .{ .object = .{} };
+            if (eql(tool.name, "fizzy_capture")) return self.capture(arena, out, id, arguments);
             const answer = if (appBuildArgs(self.io, tool, arguments)) |a|
                 app_build.run(self, arena, a)
             else switch (self.toolArgs(arena, tool, arguments)) {
@@ -463,6 +478,42 @@ pub const Bridge = struct {
             } });
         }
         return reply(out, id, .{ .@"error" = .{ .code = -32601, .message = "method not found" } });
+    }
+
+    /// `fizzy_capture`: the plugin writes the picture to a PNG, and the answer is that image itself,
+    /// so the agent sees it, with its path beside.
+    fn capture(self: *Bridge, arena: std.mem.Allocator, out: *Io.Writer, id: json.Value, arguments: json.Value) !void {
+        const given: ?[]const u8 = switch (arguments) {
+            .object => |o| if (o.get("path")) |v| switch (v) {
+                .string => |s| s,
+                else => null,
+            } else null,
+            else => null,
+        };
+        const path = given orelse try std.fs.path.join(arena, &.{ std.fs.path.dirname(self.connection_path) orelse ".", "capture.png" });
+        var w: Io.Writer.Allocating = .init(arena);
+        try std.zon.stringify.serialize(.{ .path = path }, .{ .whitespace = false }, &w.writer);
+        switch (self.call(arena, "ui.capture", w.written())) {
+            .err => |e| return reply(out, id, .{ .result = .{
+                .content = &[_]struct { type: []const u8, text: []const u8 }{.{ .type = "text", .text = e }},
+                .isError = true,
+            } }),
+            .ok => |written| {
+                const png = Io.Dir.cwd().readFileAlloc(self.io, written, arena, .limited(256 << 20)) catch |err| return reply(out, id, .{ .result = .{
+                    .content = &[_]struct { type: []const u8, text: []const u8 }{.{ .type = "text", .text = @errorName(err) }},
+                    .isError = true,
+                } });
+                const b64 = try arena.alloc(u8, std.base64.standard.Encoder.calcSize(png.len));
+                _ = std.base64.standard.Encoder.encode(b64, png);
+                return reply(out, id, .{ .result = .{
+                    .content = .{
+                        .{ .type = "image", .data = b64, .mimeType = "image/png" },
+                        .{ .type = "text", .text = written },
+                    },
+                    .isError = false,
+                } });
+            },
+        }
     }
 
     /// The plugin's arguments, as ZON, from the MCP call's JSON.

@@ -11,6 +11,7 @@
 //! | `commands.list` | — | every command: id, title, enabled, parameters (kind, description, default) |
 //! | `commands.call` | `.{ .id, .args = "<ZON>" }` | its result, or why not |
 //! | `ui.snapshot` | — | what is on screen (`automation` service): role, name, tag, rect, parent |
+//! | `ui.capture` | `.{ .path }` | a picture of the window, as fizzy drew it, written as a PNG to `path`; on screen or not |
 //! | `ui.settled` | `.{ .timeout_ms }` | once nothing is in flight, or the time is up |
 //! | `ui.act` | `.{ .steps, .snapshot, .timeout_ms }` | input played as a person's, then (by default) the screen |
 //! | `tape.play` / `tape.outcome` | a live tape / `.{ .ticket }` | a ticket / how it ended |
@@ -33,6 +34,8 @@ const Waiting = struct {
     req: *Server.Request,
     until: union(enum) {
         snapshot: Automation.SnapshotTicket,
+        /// A picture, written to `path` (the host's allocation) once taken.
+        capture: struct { ticket: Automation.CaptureTicket, path: []u8 },
         settled: i96,
         run: *Run,
         build: *Build,
@@ -96,7 +99,7 @@ fn handle(host: *sdk.Host, server: *Server, req: *Server.Request) void {
         std.zon.stringify.serialize(.{
             .app = "fizzy",
             .executable = buf[0..n],
-            .tools = .{ "commands.list", "commands.call", "ui.snapshot", "ui.settled", "ui.act", "ui.run", "plugin.build", "tape.play", "tape.outcome", "profile.report" },
+            .tools = .{ "commands.list", "commands.call", "ui.snapshot", "ui.capture", "ui.settled", "ui.act", "ui.run", "plugin.build", "tape.play", "tape.outcome", "profile.report" },
         }, .{ .whitespace = false }, &w.writer) catch return req.answer(server, false, "out of memory");
         return req.answer(server, true, w.written());
     }
@@ -115,6 +118,13 @@ fn handle(host: *sdk.Host, server: *Server, req: *Server.Request) void {
     const auto = automation(host) orelse return req.answer(server, false, "this app offers no automation service");
     if (eql(tool, "ui.snapshot")) {
         return wait(host, server, req, .{ .snapshot = auto.snapshot() });
+    }
+    if (eql(tool, "ui.capture")) {
+        const a = parse(struct { path: []const u8 }, arena, source) orelse
+            return req.answer(server, false, "ui.capture takes .{ .path = \"<absolute path of the PNG to write>\" }");
+        if (!std.fs.path.isAbsolute(a.path)) return req.answer(server, false, "give the PNG's path as an absolute path");
+        const path = host.allocator.dupe(u8, a.path) catch return req.answer(server, false, "out of memory");
+        return wait(host, server, req, .{ .capture = .{ .ticket = auto.capture(), .path = path } });
     }
     if (eql(tool, "ui.settled")) {
         const Args = struct { timeout_ms: u32 = 5000 };
@@ -182,6 +192,16 @@ fn check(host: *sdk.Host, server: *Server, w: *Waiting) bool {
         .snapshot => |t| {
             const text = auto.snapshotText(t) orelse return later(host);
             w.req.answer(server, true, text);
+            return true;
+        },
+        .capture => |c| {
+            const png = auto.captureImage(c.ticket) orelse return later(host);
+            defer host.allocator.free(c.path);
+            std.Io.Dir.cwd().writeFile(dvui.io, .{ .sub_path = c.path, .data = png }) catch |err| {
+                w.req.answer(server, false, @errorName(err));
+                return true;
+            };
+            w.req.answer(server, true, c.path);
             return true;
         },
         .settled => |deadline| {
