@@ -36,7 +36,7 @@ const Waiting = struct {
         settled: i96,
         run: *Run,
         build: *Build,
-        profile: struct { until: i96, drive: bool },
+        profile: struct { until: i96, drive: bool, startup: bool = false },
     },
 };
 
@@ -150,11 +150,12 @@ fn handle(host: *sdk.Host, server: *Server, req: *Server.Request) void {
     if (eql(tool, "profile.report")) {
         // `drive`: ask for every frame, to measure what drawing costs; else only the frames fizzy
         // draws on its own are measured (`measure.zig`).
-        const Args = struct { ms: u32 = 1000, drive: bool = false };
+        // `startup`: also when the app's start reached each phase (`core.profile.Phases`).
+        const Args = struct { ms: u32 = 1000, drive: bool = false, startup: bool = false };
         const a = parse(Args, arena, source) orelse Args{};
         // A window of averages is half a second: ask for a little more than was asked.
         core.profile.want(a.ms + 600);
-        return wait(host, server, req, .{ .profile = .{ .until = now() + ms(a.ms + 600), .drive = a.drive } });
+        return wait(host, server, req, .{ .profile = .{ .until = now() + ms(a.ms + 600), .drive = a.drive, .startup = a.startup } });
     }
     req.answer(server, false, "no such tool (hello lists them)");
 }
@@ -223,7 +224,7 @@ fn check(host: *sdk.Host, server: *Server, w: *Waiting) bool {
             };
             var out: std.Io.Writer.Allocating = .init(host.allocator);
             defer out.deinit();
-            core.profile.report(p, &out.writer, .{}) catch {};
+            core.profile.report(p, &out.writer, .{ .startup = wait_p.startup }) catch {};
             w.req.answer(server, true, out.written());
             return true;
         },

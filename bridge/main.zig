@@ -165,10 +165,11 @@ const tools = [_]Tool{
         \\Measure fizzy for a while and answer the profiler's report: fps, frame work and its
         \\worst, time per plugin and per scope, and why each frame came (.causes). Only the frames
         \\fizzy draws on its own are measured; "drive": true asks for every frame, to measure what
-        \\drawing costs. Use it instead of adding logging.
+        \\drawing costs. "startup": true adds when fizzy's start reached each phase (main, window,
+        \\plugins, first frame, shown; a restart's handover too). Use it instead of adding logging.
         ,
         .schema =
-        \\{"type":"object","properties":{"ms":{"type":"integer","default":1000},"drive":{"type":"boolean","default":false}}}
+        \\{"type":"object","properties":{"ms":{"type":"integer","default":1000},"drive":{"type":"boolean","default":false},"startup":{"type":"boolean","default":false}}}
         ,
     },
     .{
