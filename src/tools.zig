@@ -10,8 +10,8 @@
 //! | `hello` | `.{ .token }` | the tools, what fizzy offers, and the executable it runs from |
 //! | `commands.list` | — | every command: id, title, enabled, parameters (kind, description, default) |
 //! | `commands.call` | `.{ .id, .args = "<ZON>" }` | its result, or why not |
-//! | `ui.snapshot` | — | what is on screen (`automation` service): role, name, tag, rect, parent |
-//! | `ui.capture` | `.{ .path }` | a picture of the window, as fizzy drew it, written as a PNG to `path`; on screen or not |
+//! | `ui.snapshot` | — | what is on screen (`automation` service): fizzy's windows, then each widget's role, name, tag, rect, parent and window |
+//! | `ui.capture` | `.{ .path, .window }` | a picture of a window (the main one, one by its tag, or `"*"` for all), as fizzy drew it, written as a PNG to `path`; on screen or not |
 //! | `ui.settled` | `.{ .timeout_ms }` | once nothing is in flight, or the time is up |
 //! | `ui.act` | `.{ .steps, .snapshot, .timeout_ms }` | input played as a person's, then (by default) the screen |
 //! | `tape.play` / `tape.outcome` | a live tape / `.{ .ticket }` | a ticket / how it ended |
@@ -120,11 +120,11 @@ fn handle(host: *sdk.Host, server: *Server, req: *Server.Request) void {
         return wait(host, server, req, .{ .snapshot = auto.snapshot() });
     }
     if (eql(tool, "ui.capture")) {
-        const a = parse(struct { path: []const u8 }, arena, source) orelse
-            return req.answer(server, false, "ui.capture takes .{ .path = \"<absolute path of the PNG to write>\" }");
+        const a = parse(struct { path: []const u8, window: []const u8 = "" }, arena, source) orelse
+            return req.answer(server, false, "ui.capture takes .{ .path = \"<absolute path of the PNG to write>\", .window = \"<a window's tag, or \\\"*\\\" for all; none for the main window>\" }");
         if (!std.fs.path.isAbsolute(a.path)) return req.answer(server, false, "give the PNG's path as an absolute path");
         const path = host.allocator.dupe(u8, a.path) catch return req.answer(server, false, "out of memory");
-        return wait(host, server, req, .{ .capture = .{ .ticket = auto.capture(), .path = path } });
+        return wait(host, server, req, .{ .capture = .{ .ticket = auto.capture(a.window), .path = path } });
     }
     if (eql(tool, "ui.settled")) {
         const Args = struct { timeout_ms: u32 = 5000 };
@@ -197,6 +197,10 @@ fn check(host: *sdk.Host, server: *Server, w: *Waiting) bool {
         .capture => |c| {
             const png = auto.captureImage(c.ticket) orelse return later(host);
             defer host.allocator.free(c.path);
+            if (png.len == 0) {
+                w.req.answer(server, false, "no window has that tag: ui.snapshot lists them (.role = \"window\")");
+                return true;
+            }
             std.Io.Dir.cwd().writeFile(dvui.io, .{ .sub_path = c.path, .data = png }) catch |err| {
                 w.req.answer(server, false, @errorName(err));
                 return true;

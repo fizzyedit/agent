@@ -44,8 +44,11 @@ const tools = [_]Tool{
         .calls = "ui.snapshot",
         .description =
         \\What is on fizzy's screen now, as text: one line per widget worth naming — role, name,
-        \\tag (stable, for ui steps), rect in physical pixels, focused, parent index. Read it
-        \\before acting and after, as a person would look.
+        \\tag (stable, for ui steps), rect in physical pixels, focused, parent index. fizzy's
+        \\windows come first (role "window": the main one, then any dialog, menu or popped-out view
+        \\in an OS window of its own); a widget in any but the main window says which ("window":
+        \\its index). Rects are all in fizzy's one frame, so a click at one lands in its window.
+        \\Read it before acting and after, as a person would look.
         ,
         .schema =
         \\{"type":"object","properties":{}}
@@ -55,14 +58,16 @@ const tools = [_]Tool{
         .name = "fizzy_capture",
         .calls = "ui.capture",
         .description =
-        \\A picture of fizzy's window as fizzy drew it, from its own frame: works with the window
-        \\hidden, on another Space or covered, and moves nothing on the person's screen. What the
-        \\OS draws over or behind the window (its glass, Liquid Glass) is not in it: transparent.
-        \\Answers the image, and the path of the PNG written ("path": absolute; beside the
-        \\plugin's connection file when left out).
+        \\A picture of one of fizzy's windows as fizzy drew it, from its own frame: works with the
+        \\window hidden, on another Space or covered, and moves nothing on the person's screen.
+        \\"window": the main window when left out; a window's tag from fizzy_screen (its
+        \\"window" nodes: a dialog, a menu, a popped-out view); or "*" for every window, laid out
+        \\as they lie round the main one. What the OS draws over or behind a window (its glass,
+        \\Liquid Glass) is not in it: transparent. Answers the image, and the path of the PNG
+        \\written ("path": absolute; beside the plugin's connection file when left out).
         ,
         .schema =
-        \\{"type":"object","properties":{"path":{"type":"string"}}}
+        \\{"type":"object","properties":{"path":{"type":"string"},"window":{"type":"string"}}}
         ,
     },
     .{
@@ -73,6 +78,8 @@ const tools = [_]Tool{
         \\same widgets, and a person's own input stops it. Steps run in order; each is an object
         \\with one key:
         \\  {"click": {"tag": "workbench.file:/p/a.zig"}}  or  {"click": {"x": 120, "y": 340}}
+        \\  {"click": {"tag": "fizzy.window:dialog:Unsaved changes", "x": 40, "y": 60}}
+        \\      (a tag and a point: that far from its top left — into a window by its tag)
         \\  {"double_click": {...}}  {"move": {...}}       (points as in fizzy_screen's rects)
         \\  {"type": "text to type"}
         \\  {"key": "mod+s"}  (chords as the keymap spells them; "mod" is cmd on macOS, ctrl elsewhere)
@@ -483,16 +490,10 @@ pub const Bridge = struct {
     /// `fizzy_capture`: the plugin writes the picture to a PNG, and the answer is that image itself,
     /// so the agent sees it, with its path beside.
     fn capture(self: *Bridge, arena: std.mem.Allocator, out: *Io.Writer, id: json.Value, arguments: json.Value) !void {
-        const given: ?[]const u8 = switch (arguments) {
-            .object => |o| if (o.get("path")) |v| switch (v) {
-                .string => |s| s,
-                else => null,
-            } else null,
-            else => null,
-        };
+        const given = stringArg(arguments, "path");
         const path = given orelse try std.fs.path.join(arena, &.{ std.fs.path.dirname(self.connection_path) orelse ".", "capture.png" });
         var w: Io.Writer.Allocating = .init(arena);
-        try std.zon.stringify.serialize(.{ .path = path }, .{ .whitespace = false }, &w.writer);
+        try std.zon.stringify.serialize(.{ .path = path, .window = stringArg(arguments, "window") orelse "" }, .{ .whitespace = false }, &w.writer);
         switch (self.call(arena, "ui.capture", w.written())) {
             .err => |e| return reply(out, id, .{ .result = .{
                 .content = &[_]struct { type: []const u8, text: []const u8 }{.{ .type = "text", .text = e }},
@@ -702,6 +703,18 @@ fn toZon(w: *Io.Writer, v: json.Value, enum_keys: []const []const u8) !void {
             try w.writeAll("}");
         },
     }
+}
+
+/// The string argument `name`, if there is one.
+fn stringArg(arguments: json.Value, name: []const u8) ?[]const u8 {
+    const o = switch (arguments) {
+        .object => |o| o,
+        else => return null,
+    };
+    return switch (o.get(name) orelse return null) {
+        .string => |s| s,
+        else => null,
+    };
 }
 
 fn eql(a: []const u8, b: []const u8) bool {
