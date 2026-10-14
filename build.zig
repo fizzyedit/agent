@@ -15,18 +15,21 @@ pub fn build(b: *std.Build) void {
     plugin.module.addImport("replay", sdk.module("replay"));
     fizzy.plugin.install(b, plugin.lib, .{});
 
-    // std-only: it relays between an MCP client on stdio and the plugin's socket.
+    // std-only: it relays between an MCP client on stdio and the plugin's socket, and makes the
+    // pictures (scaling and encoding a frame fizzy hands over raw), so it is always built
+    // optimized: a tool, not code anyone steps through, and the encode is 10x slower in Debug.
+    const bridge_optimize: std.builtin.OptimizeMode = if (optimize == .Debug) .ReleaseFast else optimize;
     // The compiler's diagnostics, read the same way by the plugin's build loop and the bridge's.
     const diagnostics_module = b.createModule(.{
         .target = target,
-        .optimize = optimize,
+        .optimize = bridge_optimize,
         .root_source_file = b.path("src/diagnostics.zig"),
     });
     const bridge = b.addExecutable(.{
         .name = "fizzy-mcp",
         .root_module = b.createModule(.{
             .target = target,
-            .optimize = optimize,
+            .optimize = bridge_optimize,
             .root_source_file = b.path("bridge/main.zig"),
             .imports = &.{.{ .name = "diagnostics", .module = diagnostics_module }},
         }),

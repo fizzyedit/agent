@@ -11,7 +11,7 @@
 //! | `commands.list` | — | every command: id, title, enabled, parameters (kind, description, default) |
 //! | `commands.call` | `.{ .id, .args = "<ZON>" }` | its result, or why not |
 //! | `ui.snapshot` | — | what is on screen (`automation` service): fizzy's windows, then each widget's role, name, tag, rect, parent and window |
-//! | `ui.capture` | `.{ .path, .window }` | a picture of a window (the main one, one by its tag, or `"*"` for all), as fizzy drew it, written as a PNG to `path`; on screen or not |
+//! | `ui.capture` | `.{ .path, .window }` | a picture of a window (the main one, one by its tag, or `"*"` for all), as fizzy drew it, written raw to `path` (`"FZPX"`, width and height as little-endian `u32`, then premultiplied RGBA rows: the bridge scales and encodes it); on screen or not |
 //! | `ui.settled` | `.{ .timeout_ms }` | once nothing is in flight, or the time is up |
 //! | `ui.act` | `.{ .steps, .snapshot, .timeout_ms }` | input played as a person's, then (by default) the screen |
 //! | `tape.play` / `tape.outcome` | a live tape / `.{ .ticket }` | a ticket / how it ended |
@@ -121,8 +121,8 @@ fn handle(host: *sdk.Host, server: *Server, req: *Server.Request) void {
     }
     if (eql(tool, "ui.capture")) {
         const a = parse(struct { path: []const u8, window: []const u8 = "" }, arena, source) orelse
-            return req.answer(server, false, "ui.capture takes .{ .path = \"<absolute path of the PNG to write>\", .window = \"<a window's tag, or \\\"*\\\" for all; none for the main window>\" }");
-        if (!std.fs.path.isAbsolute(a.path)) return req.answer(server, false, "give the PNG's path as an absolute path");
+            return req.answer(server, false, "ui.capture takes .{ .path = \"<absolute path of the raw picture to write>\", .window = \"<a window's tag, or \\\"*\\\" for all; none for the main window>\" }");
+        if (!std.fs.path.isAbsolute(a.path)) return req.answer(server, false, "give the picture's path as an absolute path");
         const path = host.allocator.dupe(u8, a.path) catch return req.answer(server, false, "out of memory");
         return wait(host, server, req, .{ .capture = .{ .ticket = auto.capture(a.window), .path = path } });
     }
@@ -174,6 +174,23 @@ fn wait(host: *sdk.Host, server: *Server, req: *Server.Request, until: @FieldTyp
     waiting.append(host.allocator, .{ .req = req, .until = until }) catch req.answer(server, false, "out of memory");
 }
 
+/// `image` as the bridge reads it: `"FZPX"`, its width and height (little-endian `u32`s), then its
+/// pixels as drawn. No encode: that is the bridge's, in its own process, not this frame's.
+fn writeRaw(path: []const u8, image: Automation.Image) !void {
+    const io = dvui.io;
+    var file = try std.Io.Dir.cwd().createFile(io, path, .{});
+    defer file.close(io);
+    var head: [12]u8 = undefined;
+    head[0..4].* = "FZPX".*;
+    std.mem.writeInt(u32, head[4..8], image.width, .little);
+    std.mem.writeInt(u32, head[8..12], image.height, .little);
+    var buf: [64 * 1024]u8 = undefined;
+    var w = file.writer(io, &buf);
+    try w.interface.writeAll(&head);
+    try w.interface.writeAll(image.pixels);
+    try w.end();
+}
+
 /// Not yet: look again next frame, and make sure there is one. What `w` waits on is written at
 /// the end of a frame (a snapshot) or decided by one (a tape's last op), and this runs at the
 /// start of the next, which an idle app would never draw.
@@ -195,13 +212,14 @@ fn check(host: *sdk.Host, server: *Server, w: *Waiting) bool {
             return true;
         },
         .capture => |c| {
-            const png = auto.captureImage(c.ticket) orelse return later(host);
+            const image = auto.captureImage(c.ticket) orelse return later(host);
             defer host.allocator.free(c.path);
-            if (png.len == 0) {
+            if (image.width == 0) {
                 w.req.answer(server, false, "no window has that tag: ui.snapshot lists them (.role = \"window\")");
                 return true;
             }
-            std.Io.Dir.cwd().writeFile(dvui.io, .{ .sub_path = c.path, .data = png }) catch |err| {
+            // Raw, as fizzy drew it: the bridge, in its own process, scales and encodes it.
+            writeRaw(c.path, image) catch |err| {
                 w.req.answer(server, false, @errorName(err));
                 return true;
             };
