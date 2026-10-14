@@ -243,21 +243,27 @@ pub fn main(init: std.process.Init) !void {
     var stdin = Io.File.stdin().readerStreaming(io, &in_buf);
     var stdout = Io.File.stdout().writerStreaming(io, &out_buf);
     while (true) {
-        const line = stdin.interface.takeDelimiterInclusive('\n') catch |err| switch (err) {
-            error.EndOfStream => return,
-            error.StreamTooLong => {
-                _ = stdin.interface.discardDelimiterInclusive('\n') catch return;
-                continue;
-            },
-            else => return err,
-        };
         var arena: std.heap.ArenaAllocator = .init(gpa);
         defer arena.deinit();
+        const line = takeLine(&stdin.interface, arena.allocator()) catch |err| switch (err) {
+            error.EndOfStream => return,
+            else => return err,
+        };
         bridge.message(arena.allocator(), std.mem.trim(u8, line, " \t\r\n"), &stdout.interface) catch |err| {
             std.log.err("fizzy-mcp: {t}", .{err});
         };
         try stdout.interface.flush();
     }
+}
+
+/// The next line, without its newline, however long: fizzy's command list and a drawing's
+/// arguments both outgrow any fixed buffer, and a line cut short is a call that fails for no
+/// reason the caller can see.
+fn takeLine(r: *Io.Reader, arena: std.mem.Allocator) ![]u8 {
+    var line: Io.Writer.Allocating = .init(arena);
+    _ = try r.streamDelimiter(&line.writer, '\n');
+    r.toss(1);
+    return line.written();
 }
 
 /// `connection.zon`, which the agent plugin writes into its own directory under the plugins
@@ -393,8 +399,8 @@ pub const Bridge = struct {
         try std.zon.stringify.serialize(Wire.Request{ .id = id, .tool = tool, .args = args }, .{ .whitespace = false }, w);
         try w.writeByte('\n');
         try w.flush();
-        const line = try link.reader.interface.takeDelimiterInclusive('\n');
-        const source = try arena.dupeZ(u8, std.mem.trimEnd(u8, line, "\r\n"));
+        const line = try takeLine(&link.reader.interface, arena);
+        const source = try arena.dupeZ(u8, std.mem.trimEnd(u8, line, "\r"));
         const r = try std.zon.parse.fromSliceAlloc(Wire.Response, arena, source, null, .{ .ignore_unknown_fields = true });
         if (r.err) |e| return .{ .err = e };
         return .{ .ok = r.ok orelse "" };
