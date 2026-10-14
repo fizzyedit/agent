@@ -16,6 +16,7 @@ const std = @import("std");
 const Io = std.Io;
 const json = std.json;
 const app_build = @import("app_build.zig");
+const picture = @import("picture.zig");
 
 /// No stack dump for an errno std did not expect. Its Unix-socket connect has no
 /// `ConnectionRefused` (Zig 0.16), so a stale `agent.sock` with nothing listening (fizzy crashed)
@@ -62,12 +63,16 @@ const tools = [_]Tool{
         \\window hidden, on another Space or covered, and moves nothing on the person's screen.
         \\"window": the main window when left out; a window's tag from fizzy_screen (its
         \\"window" nodes: a dialog, a menu, a popped-out view); or "*" for every window, laid out
-        \\as they lie round the main one. What the OS draws over or behind a window (its glass,
-        \\Liquid Glass) is not in it: transparent. Answers the image, and the path of the PNG
-        \\written ("path": absolute; beside the plugin's connection file when left out).
+        \\as they lie round the main one. "tag": just one widget, by its tag from fizzy_screen (in
+        \\whichever window it is). What the OS draws over or behind a window (its glass, Liquid
+        \\Glass) is not in it: transparent. Scaled to what a model is shown (at most 1568 pixels on
+        \\the long side, ~1.15 MP), or to "max" pixels on the long side. Answers the image, the path
+        \\of the PNG written ("path": absolute; beside the plugin's connection file when left out),
+        \\and what it cost. fizzy only reads its frame back; the scaling and encoding happen here.
+        \\Prefer fizzy_screen when words will do: it is cheaper still.
         ,
         .schema =
-        \\{"type":"object","properties":{"path":{"type":"string"},"window":{"type":"string"}}}
+        \\{"type":"object","properties":{"path":{"type":"string"},"window":{"type":"string"},"tag":{"type":"string"},"max":{"type":"integer"}}}
         ,
     },
     .{
@@ -490,31 +495,96 @@ pub const Bridge = struct {
     /// `fizzy_capture`: the plugin writes the picture to a PNG, and the answer is that image itself,
     /// so the agent sees it, with its path beside.
     fn capture(self: *Bridge, arena: std.mem.Allocator, out: *Io.Writer, id: json.Value, arguments: json.Value) !void {
-        const given = stringArg(arguments, "path");
-        const path = given orelse try std.fs.path.join(arena, &.{ std.fs.path.dirname(self.connection_path) orelse ".", "capture.png" });
-        var w: Io.Writer.Allocating = .init(arena);
-        try std.zon.stringify.serialize(.{ .path = path, .window = stringArg(arguments, "window") orelse "" }, .{ .whitespace = false }, &w.writer);
-        switch (self.call(arena, "ui.capture", w.written())) {
-            .err => |e| return reply(out, id, .{ .result = .{
-                .content = &[_]struct { type: []const u8, text: []const u8 }{.{ .type = "text", .text = e }},
-                .isError = true,
-            } }),
-            .ok => |written| {
-                const png = Io.Dir.cwd().readFileAlloc(self.io, written, arena, .limited(256 << 20)) catch |err| return reply(out, id, .{ .result = .{
-                    .content = &[_]struct { type: []const u8, text: []const u8 }{.{ .type = "text", .text = @errorName(err) }},
+        const fail = struct {
+            fn fail(o: *Io.Writer, i: json.Value, why: []const u8) !void {
+                return reply(o, i, .{ .result = .{
+                    .content = &[_]struct { type: []const u8, text: []const u8 }{.{ .type = "text", .text = why }},
                     .isError = true,
                 } });
-                const b64 = try arena.alloc(u8, std.base64.standard.Encoder.calcSize(png.len));
-                _ = std.base64.standard.Encoder.encode(b64, png);
-                return reply(out, id, .{ .result = .{
-                    .content = .{
-                        .{ .type = "image", .data = b64, .mimeType = "image/png" },
-                        .{ .type = "text", .text = written },
-                    },
-                    .isError = false,
-                } });
-            },
+            }
+        }.fail;
+        const dir = std.fs.path.dirname(self.connection_path) orelse ".";
+        const path = stringArg(arguments, "path") orelse try std.fs.path.join(arena, &.{ dir, "capture.png" });
+        const raw_path = try std.fs.path.join(arena, &.{ dir, "capture.raw" });
+        var window = stringArg(arguments, "window") orelse "";
+        const long_side: u32 = switch (arguments) {
+            .object => |o| if (o.get("max")) |v| switch (v) {
+                .integer => |n| @intCast(std.math.clamp(n, 0, 1 << 15)),
+                else => 0,
+            } else 0,
+            else => 0,
+        };
+
+        // One widget: its rect from a snapshot, in its own window's picture.
+        var crop: ?picture.Rect = null;
+        if (stringArg(arguments, "tag")) |tag| {
+            const found = self.widgetRect(arena, tag) catch |err| return fail(out, id, switch (err) {
+                error.NoSuchTag => "no widget has that tag: fizzy_screen lists them",
+                else => @errorName(err),
+            });
+            window = found.window;
+            crop = found.rect;
         }
+
+        const t0 = nowNs(self.io);
+        var w: Io.Writer.Allocating = .init(arena);
+        try std.zon.stringify.serialize(.{ .path = raw_path, .window = window }, .{ .whitespace = false }, &w.writer);
+        switch (self.call(arena, "ui.capture", w.written())) {
+            .err => |e| return fail(out, id, e),
+            .ok => {},
+        }
+        const t1 = nowNs(self.io);
+        const bytes = Io.Dir.cwd().readFileAlloc(self.io, raw_path, arena, .limited(1 << 30)) catch |err| return fail(out, id, @errorName(err));
+        const raw = picture.parse(bytes) catch |err| return fail(out, id, @errorName(err));
+        const cw: u32 = if (crop) |r| @intCast(@max(0, @min(r.w, raw.width))) else raw.width;
+        const ch: u32 = if (crop) |r| @intCast(@max(0, @min(r.h, raw.height))) else raw.height;
+        const size = picture.fitted(cw, ch, long_side);
+        const rgba = try picture.scaled(arena, raw, crop, size.w, size.h);
+        const png = try picture.png(arena, rgba, size.w, size.h);
+        Io.Dir.cwd().writeFile(self.io, .{ .sub_path = path, .data = png }) catch |err| return fail(out, id, @errorName(err));
+        const t2 = nowNs(self.io);
+
+        const b64 = try arena.alloc(u8, std.base64.standard.Encoder.calcSize(png.len));
+        _ = std.base64.standard.Encoder.encode(b64, png);
+        const note = try std.fmt.allocPrint(arena, "{s}\n{d}x{d} (from {d}x{d}); fizzy {d} ms, here {d} ms, {d} KiB", .{
+            path,                       size.w,                     size.h, cw, ch,
+            (t1 - t0) / std.time.ns_per_ms, (t2 - t1) / std.time.ns_per_ms, png.len / 1024,
+        });
+        return reply(out, id, .{ .result = .{
+            .content = .{
+                .{ .type = "image", .data = b64, .mimeType = "image/png" },
+                .{ .type = "text", .text = note },
+            },
+            .isError = false,
+        } });
+    }
+
+    /// Where the widget `tag` names is, by a snapshot: the window it is in (its tag; empty for the
+    /// main one) and its rect in that window's picture. A snapshot's rects are in the app's one
+    /// frame; a window's picture starts at its own rect's corner.
+    fn widgetRect(self: *Bridge, arena: std.mem.Allocator, tag: []const u8) !struct { window: []const u8, rect: picture.Rect } {
+        const text = switch (self.call(arena, "ui.snapshot", "")) {
+            .ok => |t| t,
+            .err => return error.NoSnapshot,
+        };
+        const Node = struct {
+            role: []const u8 = "",
+            tag: []const u8 = "",
+            rect: struct { x: f64 = 0, y: f64 = 0, w: f64 = 0, h: f64 = 0 } = .{},
+            window: ?u32 = null,
+        };
+        const nodes = try std.zon.parse.fromSliceAlloc([]const Node, arena, try arena.dupeZ(u8, text), null, .{ .ignore_unknown_fields = true });
+        const node = for (nodes) |n| {
+            if (std.mem.eql(u8, n.tag, tag)) break n;
+        } else return error.NoSuchTag;
+        const r = node.rect;
+        var rect: picture.Rect = .{ .x = @intFromFloat(@round(r.x)), .y = @intFromFloat(@round(r.y)), .w = @intFromFloat(@round(r.w)), .h = @intFromFloat(@round(r.h)) };
+        const k = node.window orelse return .{ .window = "", .rect = rect };
+        if (k >= nodes.len) return .{ .window = "", .rect = rect };
+        const win = nodes[k];
+        rect.x -= @intFromFloat(@round(win.rect.x));
+        rect.y -= @intFromFloat(@round(win.rect.y));
+        return .{ .window = win.tag, .rect = rect };
     }
 
     /// The plugin's arguments, as ZON, from the MCP call's JSON.
@@ -706,6 +776,10 @@ fn toZon(w: *Io.Writer, v: json.Value, enum_keys: []const []const u8) !void {
 }
 
 /// The string argument `name`, if there is one.
+fn nowNs(io: Io) u64 {
+    return @intCast(Io.Clock.boot.now(io).nanoseconds);
+}
+
 fn stringArg(arguments: json.Value, name: []const u8) ?[]const u8 {
     const o = switch (arguments) {
         .object => |o| o,
@@ -755,4 +829,8 @@ test "an enumeration's string becomes an enum literal" {
     try std.testing.expectEqualStrings(
         \\.{.mode = .@"split right", .line = 12}
     , w.written());
+}
+
+test {
+    _ = picture;
 }
