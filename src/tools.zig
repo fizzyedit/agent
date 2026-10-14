@@ -17,7 +17,7 @@
 //! | `tape.play` / `tape.outcome` | a live tape / `.{ .ticket }` | a ticket / how it ended |
 //! | `profile.report` | `.{ .ms }` | the profiler's report after `ms` of frames: per plugin, per scope |
 //! | `doc.claim` | `.{ .path, .label }` | a claim on an open document (`sdk.Claim`): the person's input to it waits until `doc.release`, the connection closes, or they press Stop |
-//! | `doc.release` | `.{ .claim }` | — |
+//! | `doc.release` | `.{ .claim }` | `.{ .tape }` when the session was recorded (`Recording`), else null |
 const std = @import("std");
 const sdk = @import("fizzy_sdk");
 const dvui = @import("dvui");
@@ -26,6 +26,7 @@ const Server = @import("Server.zig");
 const Run = @import("Run.zig");
 const measure = @import("measure.zig");
 const Build = @import("Build.zig");
+const Recording = @import("Recording.zig");
 
 const Automation = sdk.services.automation.Api;
 
@@ -58,7 +59,13 @@ pub var owner: ?*sdk.Plugin = null;
 
 /// Documents claimed for a connection. UI thread only.
 var held: std.ArrayListUnmanaged(Held) = .empty;
-const Held = struct { claim: u32, conn: u32, path: []u8 };
+const Held = struct {
+    claim: u32,
+    conn: u32,
+    path: []u8,
+    /// The session on it so far, written as a tape when the claim ends.
+    rec: ?Recording = null,
+};
 
 /// What a connection should hear with its next answer: a claim the person stopped.
 var notices: std.ArrayListUnmanaged(struct { conn: u32, text: []u8 }) = .empty;
@@ -95,8 +102,9 @@ pub fn deinit(host: *sdk.Host, server: *Server) void {
         w.req.answer(server, false, "fizzy is closing");
     }
     waiting.deinit(host.allocator);
-    for (held.items) |h| {
+    for (held.items) |*h| {
         host.releaseClaim(h.claim);
+        if (finish(host, h)) |tape| host.allocator.free(tape);
         host.allocator.free(h.path);
     }
     held.deinit(host.allocator);
@@ -109,12 +117,18 @@ pub fn deinit(host: *sdk.Host, server: *Server) void {
 fn tendClaims(host: *sdk.Host, server: *Server, closed: []const u32) void {
     var i: usize = 0;
     while (i < held.items.len) {
-        const h = held.items[i];
+        const h = &held.items[i];
         const gone = std.mem.indexOfScalar(u32, closed, h.conn) != null;
         if (gone) {
             host.releaseClaim(h.claim);
+            if (finish(host, h)) |tape| {
+                std.log.info("agent: the session on {s} is a tape: {s}", .{ h.path, tape });
+                host.allocator.free(tape);
+            }
         } else if (!host.claimHolds(h.claim)) {
-            const text = std.fmt.allocPrint(server.gpa, "the person pressed Stop on {s}: leave it be, and ask before claiming it again", .{h.path}) catch null;
+            const tape = finish(host, h);
+            defer if (tape) |t| host.allocator.free(t);
+            const text = std.fmt.allocPrint(server.gpa, "the person pressed Stop on {s}: leave it be, and ask before claiming it again.{s}{s}", .{ h.path, if (tape != null) " The session so far is a tape: " else "", tape orelse "" }) catch null;
             if (text) |t| notices.append(host.allocator, .{ .conn = h.conn, .text = t }) catch server.gpa.free(t);
         } else {
             i += 1;
@@ -148,7 +162,12 @@ fn claim(host: *sdk.Host, server: *Server, req: *Server.Request, arena: std.mem.
         if (h.claim == id) return req.answer(server, true, std.fmt.allocPrint(arena, ".{{ .claim = {d} }}", .{id}) catch "?");
     }
     const path = host.allocator.dupe(u8, a.path) catch return req.answer(server, false, "out of memory");
-    held.append(host.allocator, .{ .claim = id, .conn = req.conn, .path = path }) catch {
+    const unix_s: i64 = @intCast(@divTrunc(std.Io.Clock.real.now(dvui.io).nanoseconds, std.time.ns_per_s));
+    const rec = Recording.start(host.allocator, doc, a.path, a.label, unix_s) catch |err| blk: {
+        std.log.info("agent: {s} is held but not recorded: {t}", .{ a.path, err });
+        break :blk null;
+    };
+    held.append(host.allocator, .{ .claim = id, .conn = req.conn, .path = path, .rec = rec }) catch {
         host.allocator.free(path);
         host.releaseClaim(id);
         return req.answer(server, false, "out of memory");
@@ -158,14 +177,34 @@ fn claim(host: *sdk.Host, server: *Server, req: *Server.Request, arena: std.mem.
 
 fn release(host: *sdk.Host, server: *Server, req: *Server.Request, arena: std.mem.Allocator, source: [:0]const u8) void {
     const a = parse(struct { claim: u32 }, arena, source) orelse return req.answer(server, false, "doc.release takes .{ .claim }");
-    for (held.items, 0..) |h, i| {
+    for (held.items, 0..) |*h, i| {
         if (h.claim != a.claim) continue;
         host.releaseClaim(h.claim);
+        const tape = finish(host, h);
+        defer if (tape) |t| host.allocator.free(t);
         host.allocator.free(h.path);
         _ = held.swapRemove(i);
+        if (tape) |t| return req.answer(server, true, std.fmt.allocPrint(arena, ".{{ .tape = \"{s}\" }}", .{t}) catch "null");
         break;
     }
     req.answer(server, true, "null");
+}
+
+/// Write a held document's session as a tape, if anything was recorded, into `<config>/tapes/`;
+/// the recording is done either way. Returns the tape's path, in `host.allocator`.
+fn finish(host: *sdk.Host, h: *Held) ?[]u8 {
+    var rec = h.rec orelse return null;
+    h.rec = null;
+    defer rec.deinit();
+    if (rec.empty()) return null;
+    const plugins = host.plugins_dir orelse return null;
+    const config = std.fs.path.dirname(plugins) orelse return null;
+    const dir = std.fs.path.join(host.allocator, &.{ config, "tapes" }) catch return null;
+    defer host.allocator.free(dir);
+    return rec.write(dir, dvui.io) catch |err| {
+        std.log.err("agent: could not write the tape for {s}: {t}", .{ h.path, err });
+        return null;
+    };
 }
 
 fn automation(host: *sdk.Host) ?*Automation {
@@ -199,7 +238,13 @@ fn handle(host: *sdk.Host, server: *Server, req: *Server.Request) void {
         const a = parse(struct { id: []const u8, args: []const u8 = "" }, arena, source) orelse
             return req.answer(server, false, "commands.call takes .{ .id, .args = \"<ZON>\" }");
         return switch (host.callCommand(a.id, a.args, arena)) {
-            .ok => |r| req.answer(server, true, r orelse "null"),
+            .ok => |r| {
+                for (held.items) |*h| {
+                    if (h.conn != req.conn) continue;
+                    if (h.rec) |*rec| rec.note(a.id, a.args, host.last_showing_ms) catch {};
+                }
+                req.answer(server, true, r orelse "null");
+            },
             .unknown => req.answer(server, false, "no command by that id (commands.list)"),
             .disabled => req.answer(server, false, "that command is not enabled now"),
             .bad_args => |m| req.answer(server, false, m),
