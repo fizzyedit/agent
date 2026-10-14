@@ -6,7 +6,9 @@ server an agent (Claude Code, Codex, Grok's CLI, any MCP client) runs to reach i
 - **Every command is a tool.** Plugins' commands, with their parameters, are each plugin's API
   to an agent: `fizzy_commands` lists them, and `fizzy_call` runs one with arguments.
 - **The screen as text.** `fizzy_screen` answers what is drawn: one line per widget worth
-  naming, with its role, name, tag and rect, read from the frame dvui just drew.
+  naming, with its role, name, tag and rect, read from the frame dvui just drew. Every window
+  fizzy draws is in it — a dialog, a menu or a view popped out into an OS window of its own —
+  each widget saying which, and `fizzy_capture` pictures any of them by its tag.
 - **Scripts in one call.** `fizzy_run` runs a list of steps (input, commands with arguments,
   waits, expectations, settling, the screen, the profiler) across fizzy's frames and answers one
   report, with the step that failed and why. Turns are what an agent's iteration costs; a check

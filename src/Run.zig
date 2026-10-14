@@ -39,7 +39,8 @@ failed: ?usize = null,
 asked_anchors_at: ?i128 = null,
 
 pub const Step = union(enum) {
-    /// A tagged widget, or a point in the window in physical pixels (as a snapshot's rects are).
+    /// A tagged widget, a point in the frame in physical pixels (as a snapshot's rects are), or
+    /// both: a point from the tagged widget's top left — a window's tag, and a point in it.
     click: Point,
     double_click: Point,
     move: Point,
@@ -375,7 +376,13 @@ fn playTape(self: *Run, auto: *Automation, steps: []const Step) !Automation.Tick
 }
 
 fn target(p: Point, win: dvui.Rect.Physical) Tape.Target {
-    if (p.tag.len > 0) return .{ .tag = p.tag };
+    if (p.tag.len > 0) {
+        // Its middle, or a point from its top left: physical pixels, which a tape nudges by in
+        // natural ones.
+        if (p.x == null and p.y == null) return .{ .tag = p.tag };
+        const s = dvui.windowNaturalScale();
+        return .{ .tag = p.tag, .x = 0, .y = 0, .dx = (p.x orelse 0) / s, .dy = (p.y orelse 0) / s };
+    }
     return .{ .x = (p.x orelse 0) / @max(win.w, 1), .y = (p.y orelse 0) / @max(win.h, 1) };
 }
 
