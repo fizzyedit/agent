@@ -153,11 +153,15 @@ const tools = [_]Tool{
         .name = "fizzy_commands",
         .calls = "commands.list",
         .description =
-        \\Every command fizzy's plugins offer — the agent's API to each plugin: id, title, whether
-        \\it can run now, and its parameters (kind, description, default, choices, range).
+        \\The commands fizzy's plugins offer — the agent's API to each plugin. With no prefix, an
+        \\index, a line per command: its id and title, and "(not now)" when it cannot run. With a prefix (a plugin's id
+        \\and a dot, as "pixi.", or a whole id), those commands in full: their parameters too (kind,
+        \\description, default, choices, range). Find what you need in the index, then read that
+        \\plugin's commands by prefix before calling them.
         ,
         .schema =
-        \\{"type":"object","properties":{}}
+        \\{"type":"object","properties":{
+        \\"prefix":{"type":"string","description":"A plugin's id and a dot (\"pixi.\"), or a command's id"}}}
         ,
     },
     .{
@@ -667,7 +671,9 @@ pub const Bridge = struct {
             id: []const u8,
             params: []const struct { key: []const u8, kind: []const u8 } = &.{},
         };
-        const list = switch (self.call(arena, "commands.list", "")) {
+        var args: Io.Writer.Allocating = .init(arena);
+        std.zon.stringify.serialize(.{ .prefix = id }, .{ .whitespace = false }, &args.writer) catch return &.{};
+        const list = switch (self.call(arena, "commands.list", args.written())) {
             .ok => |s| s,
             .err => return &.{},
         };
