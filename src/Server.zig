@@ -213,11 +213,11 @@ fn serve(self: *Server, stream: Io.net.Stream) void {
     var writer = stream.writer(self.io, &write_buf);
     var greeted = false;
     while (!self.stopping.load(.acquire)) {
-        const line = reader.interface.takeDelimiterInclusive('\n') catch return;
         var arena: std.heap.ArenaAllocator = .init(self.gpa);
         defer arena.deinit();
         const a = arena.allocator();
-        const source = a.dupeZ(u8, std.mem.trimEnd(u8, line, "\r\n")) catch return;
+        const line = takeLine(&reader.interface, a) catch return;
+        const source = a.dupeZ(u8, std.mem.trimEnd(u8, line, "\r")) catch return;
         const wire = std.zon.parse.fromSliceAlloc(Wire.Request, a, source, null, .{ .ignore_unknown_fields = true }) catch {
             respond(&writer.interface, .{ .id = 0, .err = "not a request: one ZON value per line, .{ .id, .tool, .args }" }) catch return;
             continue;
@@ -249,4 +249,13 @@ fn respond(w: *Io.Writer, r: Wire.Response) !void {
     try std.zon.stringify.serialize(r, .{ .whitespace = false, .emit_default_optional_fields = false }, w);
     try w.writeByte('\n');
     try w.flush();
+}
+
+/// The next line, without its newline, however long: a request carries a command's arguments,
+/// and a drawing's can be far larger than the read buffer.
+pub fn takeLine(r: *Io.Reader, arena: std.mem.Allocator) ![]u8 {
+    var line: Io.Writer.Allocating = .init(arena);
+    _ = try r.streamDelimiter(&line.writer, '\n');
+    r.toss(1);
+    return line.written();
 }
