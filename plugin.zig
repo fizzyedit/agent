@@ -38,6 +38,7 @@ var state: u8 = 0;
 pub fn register(h: *sdk.Host) !void {
     host = h;
     plugin.state = @ptrCast(&state);
+    tools.owner = &plugin;
     try h.registerPlugin(&plugin);
 }
 

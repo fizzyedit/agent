@@ -40,8 +40,13 @@ socket_inode: ?std.Io.File.INode = null,
 /// Requests waiting for the UI thread, under `lock`.
 lock: Io.Mutex = .init,
 pending: std.ArrayListUnmanaged(*Request) = .empty,
+/// Connections that have closed since the UI thread last looked, by id, under `lock`: what they
+/// held (`tools`' claims) is let go.
+closed: std.ArrayListUnmanaged(u32) = .empty,
+next_conn: u32 = 1,
 
 const Conn = struct {
+    id: u32,
     stream: Io.net.Stream,
     thread: ?std.Thread = null,
     done: std.atomic.Value(bool) = .init(false),
@@ -68,6 +73,11 @@ pub const Request = struct {
     id: u64,
     tool: []const u8,
     args: []const u8,
+    /// The connection it came on (`Conn.id`).
+    conn: u32 = 0,
+    /// Something its caller should know that is not this answer (a claim the person stopped),
+    /// added after it as a ZON comment. `gpa`-owned; `answer` frees it.
+    notice: ?[]u8 = null,
     /// Set by the UI thread (`answer`); the connection's thread owns both strings after.
     ok: ?[]u8 = null,
     err: ?[]u8 = null,
@@ -75,7 +85,12 @@ pub const Request = struct {
 
     /// Answer, from the UI thread: copies `text` with `gpa`, which must be safe across threads.
     pub fn answer(self: *Request, server: *Server, ok: bool, text: []const u8) void {
-        const copy = server.gpa.dupe(u8, text) catch null;
+        const copy = if (self.notice) |n|
+            std.fmt.allocPrint(server.gpa, "{s}\n// {s}", .{ text, n }) catch null
+        else
+            server.gpa.dupe(u8, text) catch null;
+        if (self.notice) |n| server.gpa.free(n);
+        self.notice = null;
         if (ok) self.ok = copy else self.err = copy;
         self.done.set(server.io);
     }
@@ -86,11 +101,13 @@ pub fn start(self: *Server) !void {
 }
 
 /// Requests the UI thread should answer now. On the UI thread, each frame.
-pub fn take(self: *Server, out: *std.ArrayListUnmanaged(*Request)) void {
+pub fn take(self: *Server, out: *std.ArrayListUnmanaged(*Request), closed: *std.ArrayListUnmanaged(u32)) void {
     self.lock.lockUncancelable(self.io);
     defer self.lock.unlock(self.io);
     out.appendSlice(self.gpa, self.pending.items) catch return;
     self.pending.clearRetainingCapacity();
+    closed.appendSlice(self.gpa, self.closed.items) catch return;
+    self.closed.clearRetainingCapacity();
 }
 
 pub fn stop(self: *Server) void {
@@ -132,6 +149,7 @@ pub fn stop(self: *Server) void {
         } else |_| {}
     }
     self.pending.deinit(self.gpa);
+    self.closed.deinit(self.gpa);
 }
 
 fn run(self: *Server) void {
@@ -164,9 +182,10 @@ fn run(self: *Server) void {
             stream.close(self.io);
             continue;
         };
-        conn.* = .{ .stream = stream };
         self.lock.lockUncancelable(self.io);
         defer self.lock.unlock(self.io);
+        conn.* = .{ .id = self.next_conn, .stream = stream };
+        self.next_conn +%= 1;
         self.reap();
         self.conns.append(self.gpa, conn) catch {
             stream.close(self.io);
@@ -183,10 +202,12 @@ fn run(self: *Server) void {
 }
 
 fn serveConn(self: *Server, conn: *Conn) void {
-    self.serve(conn.stream);
+    self.serve(conn.stream, conn.id);
     // Closed under `lock`, with `done`, so `stop` never shuts down a descriptor already closed.
     self.lock.lockUncancelable(self.io);
     defer self.lock.unlock(self.io);
+    self.closed.append(self.gpa, conn.id) catch {};
+    self.wake();
     conn.stream.close(self.io);
     conn.done.store(true, .release);
 }
@@ -206,7 +227,7 @@ fn reap(self: *Server) void {
     }
 }
 
-fn serve(self: *Server, stream: Io.net.Stream) void {
+fn serve(self: *Server, stream: Io.net.Stream, conn_id: u32) void {
     var read_buf: [64 * 1024]u8 = undefined;
     var write_buf: [16 * 1024]u8 = undefined;
     var reader = stream.reader(self.io, &read_buf);
@@ -229,7 +250,7 @@ fn serve(self: *Server, stream: Io.net.Stream) void {
             }
             greeted = true;
         }
-        var req: Request = .{ .id = wire.id, .tool = wire.tool, .args = wire.args };
+        var req: Request = .{ .id = wire.id, .tool = wire.tool, .args = wire.args, .conn = conn_id };
         {
             self.lock.lockUncancelable(self.io);
             defer self.lock.unlock(self.io);

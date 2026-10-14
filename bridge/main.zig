@@ -217,6 +217,28 @@ const tools = [_]Tool{
         \\{"type":"object","properties":{"ticket":{"type":"integer"}},"required":["ticket"]}
         ,
     },
+    .{
+        .name = "fizzy_claim",
+        .calls = "doc.claim",
+        .description =
+        \\Hold an open document while you work on it over several calls: the person's clicks, keys
+        \\and commands on it wait (the rest of fizzy stays theirs), its panes say "<label> is working
+        \\here", and they can press Stop. Your own fizzy_call commands still reach it; pass its path
+        \\to them. Answers .{ .claim }. Released by fizzy_release, when this connection closes, or by
+        \\the person, which a later answer tells you.
+        ,
+        .schema =
+        \\{"type":"object","properties":{"path":{"type":"string","description":"The open document's path."},"label":{"type":"string","description":"Who is working, as the person reads it, e.g. Claude."}},"required":["path"]}
+        ,
+    },
+    .{
+        .name = "fizzy_release",
+        .calls = "doc.release",
+        .description = "Let go of a document fizzy_claim held: the person's input reaches it again.",
+        .schema =
+        \\{"type":"object","properties":{"claim":{"type":"integer"}},"required":["claim"]}
+        ,
+    },
 };
 
 pub fn main(init: std.process.Init) !void {
@@ -713,6 +735,8 @@ const instructions =
     \\the way a person does, so the person watching sees each step. Look with fizzy_screen, act
     \\with fizzy_act (pointer, keys, typing) or fizzy_call (a plugin's command, with arguments —
     \\fizzy_commands lists them), and measure with fizzy_profile rather than adding logging.
+    \\Working on a document over several calls, claim it first (fizzy_claim) so the person's input
+    \\does not land in the middle of your work, and release it when you are done.
 ;
 
 fn listTools(out: *Io.Writer, id: json.Value) !void {

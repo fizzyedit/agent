@@ -16,6 +16,8 @@
 //! | `ui.act` | `.{ .steps, .snapshot, .timeout_ms }` | input played as a person's, then (by default) the screen |
 //! | `tape.play` / `tape.outcome` | a live tape / `.{ .ticket }` | a ticket / how it ended |
 //! | `profile.report` | `.{ .ms }` | the profiler's report after `ms` of frames: per plugin, per scope |
+//! | `doc.claim` | `.{ .path, .label }` | a claim on an open document (`sdk.Claim`): the person's input to it waits until `doc.release`, the connection closes, or they press Stop |
+//! | `doc.release` | `.{ .claim }` | — |
 const std = @import("std");
 const sdk = @import("fizzy_sdk");
 const dvui = @import("dvui");
@@ -51,12 +53,28 @@ fn ms(n: u32) i96 {
     return @as(i96, n) * std.time.ns_per_ms;
 }
 
+/// The agent plugin itself, which claims documents (`doc.claim`). Set by `plugin.zig`.
+pub var owner: ?*sdk.Plugin = null;
+
+/// Documents claimed for a connection. UI thread only.
+var held: std.ArrayListUnmanaged(Held) = .empty;
+const Held = struct { claim: u32, conn: u32, path: []u8 };
+
+/// What a connection should hear with its next answer: a claim the person stopped.
+var notices: std.ArrayListUnmanaged(struct { conn: u32, text: []u8 }) = .empty;
+
 /// Take what arrived and answer what can be. Once a frame, from `beginFrame`.
 pub fn frame(host: *sdk.Host, server: *Server) void {
     var batch: std.ArrayListUnmanaged(*Server.Request) = .empty;
     defer batch.deinit(host.allocator);
-    server.take(&batch);
-    for (batch.items) |req| handle(host, server, req);
+    var closed: std.ArrayListUnmanaged(u32) = .empty;
+    defer closed.deinit(host.allocator);
+    server.take(&batch, &closed);
+    tendClaims(host, server, closed.items);
+    for (batch.items) |req| {
+        attachNotice(server, req);
+        handle(host, server, req);
+    }
 
     var i: usize = 0;
     while (i < waiting.items.len) {
@@ -77,6 +95,77 @@ pub fn deinit(host: *sdk.Host, server: *Server) void {
         w.req.answer(server, false, "fizzy is closing");
     }
     waiting.deinit(host.allocator);
+    for (held.items) |h| {
+        host.releaseClaim(h.claim);
+        host.allocator.free(h.path);
+    }
+    held.deinit(host.allocator);
+    for (notices.items) |n| server.gpa.free(n.text);
+    notices.deinit(host.allocator);
+}
+
+/// Let go of what closed connections held, and turn claims the person stopped into a notice for
+/// the connection that made them.
+fn tendClaims(host: *sdk.Host, server: *Server, closed: []const u32) void {
+    var i: usize = 0;
+    while (i < held.items.len) {
+        const h = held.items[i];
+        const gone = std.mem.indexOfScalar(u32, closed, h.conn) != null;
+        if (gone) {
+            host.releaseClaim(h.claim);
+        } else if (!host.claimHolds(h.claim)) {
+            const text = std.fmt.allocPrint(server.gpa, "the person pressed Stop on {s}: leave it be, and ask before claiming it again", .{h.path}) catch null;
+            if (text) |t| notices.append(host.allocator, .{ .conn = h.conn, .text = t }) catch server.gpa.free(t);
+        } else {
+            i += 1;
+            continue;
+        }
+        host.allocator.free(h.path);
+        _ = held.swapRemove(i);
+    }
+}
+
+fn attachNotice(server: *Server, req: *Server.Request) void {
+    for (notices.items, 0..) |n, i| {
+        if (n.conn != req.conn) continue;
+        if (req.notice) |old| server.gpa.free(old);
+        req.notice = n.text;
+        _ = notices.swapRemove(i);
+        return;
+    }
+}
+
+fn claim(host: *sdk.Host, server: *Server, req: *Server.Request, arena: std.mem.Allocator, source: [:0]const u8) void {
+    const a = parse(struct { path: []const u8, label: []const u8 = "An agent" }, arena, source) orelse
+        return req.answer(server, false, "doc.claim takes .{ .path, .label }");
+    const me = owner orelse return req.answer(server, false, "the agent plugin is not registered");
+    const doc = host.docFromPath(a.path) orelse return req.answer(server, false, "that document is not open: open it first (fizzy.openFiles)");
+    const id = host.claimDocument(me, doc.id, a.label) catch |err| return req.answer(server, false, switch (err) {
+        error.DocumentClaimed => "someone else is working on that document",
+        else => "out of memory",
+    });
+    for (held.items) |h| {
+        if (h.claim == id) return req.answer(server, true, std.fmt.allocPrint(arena, ".{{ .claim = {d} }}", .{id}) catch "?");
+    }
+    const path = host.allocator.dupe(u8, a.path) catch return req.answer(server, false, "out of memory");
+    held.append(host.allocator, .{ .claim = id, .conn = req.conn, .path = path }) catch {
+        host.allocator.free(path);
+        host.releaseClaim(id);
+        return req.answer(server, false, "out of memory");
+    };
+    req.answer(server, true, std.fmt.allocPrint(arena, ".{{ .claim = {d} }}", .{id}) catch "?");
+}
+
+fn release(host: *sdk.Host, server: *Server, req: *Server.Request, arena: std.mem.Allocator, source: [:0]const u8) void {
+    const a = parse(struct { claim: u32 }, arena, source) orelse return req.answer(server, false, "doc.release takes .{ .claim }");
+    for (held.items, 0..) |h, i| {
+        if (h.claim != a.claim) continue;
+        host.releaseClaim(h.claim);
+        host.allocator.free(h.path);
+        _ = held.swapRemove(i);
+        break;
+    }
+    req.answer(server, true, "null");
 }
 
 fn automation(host: *sdk.Host) ?*Automation {
@@ -99,11 +188,13 @@ fn handle(host: *sdk.Host, server: *Server, req: *Server.Request) void {
         std.zon.stringify.serialize(.{
             .app = "fizzy",
             .executable = buf[0..n],
-            .tools = .{ "commands.list", "commands.call", "ui.snapshot", "ui.capture", "ui.settled", "ui.act", "ui.run", "plugin.build", "tape.play", "tape.outcome", "profile.report" },
+            .tools = .{ "commands.list", "commands.call", "ui.snapshot", "ui.capture", "ui.settled", "ui.act", "ui.run", "plugin.build", "tape.play", "tape.outcome", "profile.report", "doc.claim", "doc.release" },
         }, .{ .whitespace = false }, &w.writer) catch return req.answer(server, false, "out of memory");
         return req.answer(server, true, w.written());
     }
     if (eql(tool, "commands.list")) return listCommands(host, server, req, arena);
+    if (eql(tool, "doc.claim")) return claim(host, server, req, arena, source);
+    if (eql(tool, "doc.release")) return release(host, server, req, arena, source);
     if (eql(tool, "commands.call")) {
         const a = parse(struct { id: []const u8, args: []const u8 = "" }, arena, source) orelse
             return req.answer(server, false, "commands.call takes .{ .id, .args = \"<ZON>\" }");
