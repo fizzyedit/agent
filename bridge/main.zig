@@ -86,6 +86,16 @@ const tools = [_]Tool{
         \\  {"click": {"tag": "fizzy.window:dialog:Unsaved changes", "x": 40, "y": 60}}
         \\      (a tag and a point: that far from its top left — into a window by its tag)
         \\  {"double_click": {...}}  {"move": {...}}       (points as in fizzy_screen's rects)
+        \\  {"click": {"tag": "...", "fx": 0.25, "fy": 0.5}}  (a point as fractions of the widget)
+        \\  {"stroke": {"tag": "pixi.canvas:/p/a.pixi", "points": [{"fx": 0.1, "fy": 0.2},
+        \\      {"fx": 0.6, "fy": 0.2, "ms": 120}], "ms": 60}}
+        \\      (a pen's stroke: pressed at the first point, carried through the rest in straight
+        \\      lines, released at the last; "ms" a point's time from the last; one point is a dab.
+        \\      It is the person's pointer: for testing what a person does. To draw in a document
+        \\      beside them, use its plugin's commands, as pixi.draw's stroke)
+        \\  {"stroke": {"tag": "pixi.canvas:/p/a.pixi", "grid": [32, 32], "cells": [[4, 4], [27, 4]], "ms": 45}}
+        \\      (the same, in cells of the widget seen as a grid: a sprite's pixels; "ms" a cell)
+        \\  {"click": {"tag": "...", "grid": [32, 32], "cell": [4, 4]}}  (a cell's middle)
         \\  {"type": "text to type"}
         \\  {"key": "mod+s"}  (chords as the keymap spells them; "mod" is cmd on macOS, ctrl elsewhere)
         \\  {"wait_for": "tag"}  (until that widget is drawn)
@@ -107,7 +117,7 @@ const tools = [_]Tool{
         \\call each. Steps run in order; each is an object with one key. Input and waits play as a
         \\person's would (a click of theirs stops the run):
         \\  {"click": {"tag": "..."}} or {"click": {"x": 120, "y": 340}}, {"double_click": ...},
-        \\  {"move": ...}, {"type": "text"}, {"key": "mod+s"}, {"command": "id"},
+        \\  {"move": ...}, {"stroke": ...} (as fizzy_act's), {"type": "text"}, {"key": "mod+s"}, {"command": "id"},
         \\  {"wait_for": "tag"}, {"wait_gone": "tag"}
         \\The rest run between them:
         \\  {"call": {"id": "text.write", "args": {...}}}  a command with arguments; its result is reported
@@ -219,6 +229,28 @@ const tools = [_]Tool{
         .description = "How a tape fizzy_tape started is going, or ended.",
         .schema =
         \\{"type":"object","properties":{"ticket":{"type":"integer"}},"required":["ticket"]}
+        ,
+    },
+    .{
+        .name = "fizzy_claim",
+        .calls = "doc.claim",
+        .description =
+        \\Hold an open document while you work on it over several calls: the person's clicks, keys
+        \\and commands on it wait (the rest of fizzy stays theirs), its panes say "<label> is working
+        \\here", and they can press Stop. Your own fizzy_call commands still reach it; pass its path
+        \\to them. Answers .{ .claim }. Released by fizzy_release, when this connection closes, or by
+        \\the person, which a later answer tells you. The session on it is recorded as a tape.
+        ,
+        .schema =
+        \\{"type":"object","properties":{"path":{"type":"string","description":"The open document's path."},"label":{"type":"string","description":"Who is working, as the person reads it, e.g. Claude."}},"required":["path"]}
+        ,
+    },
+    .{
+        .name = "fizzy_release",
+        .calls = "doc.release",
+        .description = "Let go of the documents you are working on, when you are done: the person's input reaches them again. With no arguments, every one you hold; or one, by its path or its claim. Answers .{ .tapes }: each session recorded, the document as you took it and then each command that changed it, which the person plays back (and rewinds) with fizzy.demo.playTape.",
+        .schema =
+        \\{"type":"object","properties":{"path":{"type":"string"},"claim":{"type":"integer"}}}
         ,
     },
 };
@@ -716,9 +748,18 @@ fn appBuildArgs(io: Io, tool: Tool, arguments: json.Value) ?app_build.Args {
 
 const instructions =
     \\fizzy is a native editor whose every feature is a plugin. These tools drive a running fizzy
-    \\the way a person does, so the person watching sees each step. Look with fizzy_screen, act
-    \\with fizzy_act (pointer, keys, typing) or fizzy_call (a plugin's command, with arguments —
-    \\fizzy_commands lists them), and measure with fizzy_profile rather than adding logging.
+    \\the way a person does, so the person watching sees each step.
+    \\
+    \\Make and change documents with their plugins' commands. fizzy_commands lists them all, a line
+    \\each; read a plugin's in full by its prefix ("pixi.", "text.") and run them with fizzy_call.
+    \\One command does what takes a person many clicks (pixi.draw paints a whole drawing from rows
+    \\of characters), so never draw, type into or edit a document by clicking with fizzy_act. Keep
+    \\fizzy_act for what no command does, and look with fizzy_screen and fizzy_capture.
+    \\
+    \\Your first command on a document takes it: it shows beside the person, they see it worked
+    \\on, and their input to it waits. When you are done, call fizzy_release: the person gets the
+    \\document back, and your session as a tape they can play and rewind. Left alone for a minute
+    \\it is let go by itself. Measure with fizzy_profile rather than adding logging.
 ;
 
 fn listTools(out: *Io.Writer, id: json.Value) !void {
