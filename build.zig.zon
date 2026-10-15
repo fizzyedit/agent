@@ -10,8 +10,8 @@
             // clean clone, and the release asset (never the tag's git archive) is the SDK
             // package alone. To build against a local fizzy instead:
             // `zig build --fork=<fizzy checkout>/sdk`.
-            .url = "https://github.com/fizzyedit/fizzy/releases/download/sdk-v0.2.26/fizzy-sdk-v0.2.26.tar.gz",
-            .hash = "fizzy-0.2.26-SGBwY8PFJADYTlbtNoDPd21a3l4Kwv0EF6Zcp--jzU81",
+            .url = "https://github.com/fizzyedit/fizzy/releases/download/sdk-v0.2.27/fizzy-sdk-v0.2.27.tar.gz",
+            .hash = "fizzy-0.2.27-SGBwY6HqJADHytP_jdv-A_56P-8c6V9vp6FRigyVnrdm",
         },
     },
 }
