@@ -234,9 +234,9 @@ const tools = [_]Tool{
     .{
         .name = "fizzy_release",
         .calls = "doc.release",
-        .description = "Let go of a document fizzy_claim held: the person's input reaches it again. Answers .{ .tape } when the session was recorded: the document as claimed, then each command that changed it, which the person plays back (and rewinds) with fizzy.demo.playTape.",
+        .description = "Let go of the documents you are working on, when you are done: the person's input reaches them again. With no arguments, every one you hold; or one, by its path or its claim. Answers .{ .tapes }: each session recorded, the document as you took it and then each command that changed it, which the person plays back (and rewinds) with fizzy.demo.playTape.",
         .schema =
-        \\{"type":"object","properties":{"claim":{"type":"integer"}},"required":["claim"]}
+        \\{"type":"object","properties":{"path":{"type":"string"},"claim":{"type":"integer"}}}
         ,
     },
 };
@@ -732,11 +732,18 @@ fn appBuildArgs(io: Io, tool: Tool, arguments: json.Value) ?app_build.Args {
 
 const instructions =
     \\fizzy is a native editor whose every feature is a plugin. These tools drive a running fizzy
-    \\the way a person does, so the person watching sees each step. Look with fizzy_screen, act
-    \\with fizzy_act (pointer, keys, typing) or fizzy_call (a plugin's command, with arguments —
-    \\fizzy_commands lists them), and measure with fizzy_profile rather than adding logging.
-    \\Working on a document over several calls, claim it first (fizzy_claim) so the person's input
-    \\does not land in the middle of your work, and release it when you are done.
+    \\the way a person does, so the person watching sees each step.
+    \\
+    \\Make and change documents with their plugins' commands. fizzy_commands lists them all, a line
+    \\each; read a plugin's in full by its prefix ("pixi.", "text.") and run them with fizzy_call.
+    \\One command does what takes a person many clicks (pixi.draw paints a whole drawing from rows
+    \\of characters), so never draw, type into or edit a document by clicking with fizzy_act. Keep
+    \\fizzy_act for what no command does, and look with fizzy_screen and fizzy_capture.
+    \\
+    \\Your first command on a document takes it: it shows beside the person, they see it worked
+    \\on, and their input to it waits. When you are done, call fizzy_release: the person gets the
+    \\document back, and your session as a tape they can play and rewind. Left alone for a minute
+    \\it is let go by itself. Measure with fizzy_profile rather than adding logging.
 ;
 
 fn listTools(out: *Io.Writer, id: json.Value) !void {
