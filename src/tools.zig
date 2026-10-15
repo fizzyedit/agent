@@ -8,7 +8,7 @@
 //! | tool | arguments | result |
 //! |---|---|---|
 //! | `hello` | `.{ .token }` | the tools, what fizzy offers, and the executable it runs from |
-//! | `commands.list` | — | every command: id, title, enabled, parameters (kind, description, default) |
+//! | `commands.list` | `.{ .prefix }` | no prefix: a line per command, its id and title (and "(not now)" when it cannot run); with one (`"pixi."`, or a whole id): those commands in full, parameters too (kind, description, default) |
 //! | `commands.call` | `.{ .id, .args = "<ZON>" }` | its result, or why not |
 //! | `ui.snapshot` | — | what is on screen (`automation` service): fizzy's windows, then each widget's role, name, tag, rect, parent and window |
 //! | `ui.capture` | `.{ .path, .window }` | a picture of a window (the main one, one by its tag, or `"*"` for all), as fizzy drew it, written raw to `path` (`"FZPX"`, width and height as little-endian `u32`, then premultiplied RGBA rows: the bridge scales and encodes it); on screen or not |
@@ -266,7 +266,11 @@ fn handle(host: *sdk.Host, server: *Server, req: *Server.Request) void {
         }, .{ .whitespace = false }, &w.writer) catch return req.answer(server, false, "out of memory");
         return req.answer(server, true, w.written());
     }
-    if (eql(tool, "commands.list")) return listCommands(host, server, req, arena);
+    if (eql(tool, "commands.list")) {
+        const a = parse(struct { prefix: []const u8 = "" }, arena, source) orelse
+            return req.answer(server, false, "commands.list takes .{ .prefix = \"<a plugin's id and a dot, or a command's id>\" }");
+        return listCommands(host, server, req, arena, a.prefix);
+    }
     if (eql(tool, "doc.claim")) return claim(host, server, req, arena, source);
     if (eql(tool, "doc.release")) return release(host, server, req, arena, source);
     if (eql(tool, "commands.call")) {
@@ -491,7 +495,10 @@ fn outcomeText(buf: []u8, o: Automation.Outcome) []const u8 {
     };
 }
 
-fn listCommands(host: *sdk.Host, server: *Server, req: *Server.Request, arena: std.mem.Allocator) void {
+/// With no `prefix`, an index, a line per command: its id, its title and whether it can run, which is all an
+/// agent needs to find one, and a small part of the whole (pixi alone offers some eighty). With
+/// one, the commands whose ids start with it, parameters too.
+fn listCommands(host: *sdk.Host, server: *Server, req: *Server.Request, arena: std.mem.Allocator, prefix: []const u8) void {
     const ParamOut = struct {
         key: []const u8,
         label: []const u8,
@@ -509,9 +516,15 @@ fn listCommands(host: *sdk.Host, server: *Server, req: *Server.Request, arena: s
         enabled: bool,
         params: []const ParamOut,
     };
+    var w: std.Io.Writer.Allocating = .init(arena);
     var out: std.ArrayListUnmanaged(CommandOut) = .empty;
     for (0..host.commandCount()) |i| {
         const c = host.commandAt(i) orelse continue;
+        if (prefix.len == 0) {
+            w.writer.print("{s}  {s}{s}\n", .{ c.id, c.title, if (host.commandEnabled(c.id)) "" else "  (not now)" }) catch {};
+            continue;
+        }
+        if (!std.mem.startsWith(u8, c.id, prefix)) continue;
         var params: std.ArrayListUnmanaged(ParamOut) = .empty;
         for (c.params) |p| {
             var po: ParamOut = .{ .key = p.key, .label = p.label, .description = p.description, .kind = @tagName(p.kind), .required = p.required, .default = p.default };
@@ -531,8 +544,7 @@ fn listCommands(host: *sdk.Host, server: *Server, req: *Server.Request, arena: s
         }
         out.append(arena, .{ .id = c.id, .title = c.title, .enabled = host.commandEnabled(c.id), .params = params.items }) catch {};
     }
-    var w: std.Io.Writer.Allocating = .init(arena);
-    std.zon.stringify.serialize(out.items, .{ .emit_default_optional_fields = false }, &w.writer) catch {};
+    if (prefix.len > 0) std.zon.stringify.serialize(out.items, .{ .emit_default_optional_fields = false }, &w.writer) catch {};
     req.answer(server, true, w.written());
 }
 
