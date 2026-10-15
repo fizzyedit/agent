@@ -225,7 +225,7 @@ const tools = [_]Tool{
         \\and commands on it wait (the rest of fizzy stays theirs), its panes say "<label> is working
         \\here", and they can press Stop. Your own fizzy_call commands still reach it; pass its path
         \\to them. Answers .{ .claim }. Released by fizzy_release, when this connection closes, or by
-        \\the person, which a later answer tells you.
+        \\the person, which a later answer tells you. The session on it is recorded as a tape.
         ,
         .schema =
         \\{"type":"object","properties":{"path":{"type":"string","description":"The open document's path."},"label":{"type":"string","description":"Who is working, as the person reads it, e.g. Claude."}},"required":["path"]}
@@ -234,7 +234,7 @@ const tools = [_]Tool{
     .{
         .name = "fizzy_release",
         .calls = "doc.release",
-        .description = "Let go of a document fizzy_claim held: the person's input reaches it again.",
+        .description = "Let go of a document fizzy_claim held: the person's input reaches it again. Answers .{ .tape } when the session was recorded: the document as claimed, then each command that changed it, which the person plays back (and rewinds) with fizzy.demo.playTape.",
         .schema =
         \\{"type":"object","properties":{"claim":{"type":"integer"}},"required":["claim"]}
         ,
