@@ -18,6 +18,8 @@ const std = @import("std");
 const builtin = @import("builtin");
 const Io = std.Io;
 
+const has_wake_pipe = builtin.os.tag != .windows;
+
 gpa: std.mem.Allocator,
 io: Io,
 socket_path: []u8,
@@ -32,8 +34,9 @@ stopping: std.atomic.Value(bool) = .init(false),
 /// A pipe `stop` writes to, which wakes the thread waiting to accept (`run`). Waking it by
 /// connecting to the socket's path reaches whoever listens there now, which is not always this
 /// server: a fizzy taking over from this one (a restart's handover, on the same profile) has made
-/// the path its own. Not on Windows, which keeps connecting.
-wake_pipe: [2]std.c.fd_t = .{ -1, -1 },
+/// the path its own. Not on Windows, whose descriptors are handles, not small integers to poll a
+/// pipe beside a socket with: it keeps connecting.
+wake_pipe: if (has_wake_pipe) [2]std.c.fd_t else void = if (has_wake_pipe) .{ -1, -1 } else {},
 /// The socket file this server made, by inode: `stop` removes the path only while it is still this
 /// one, not the socket a fizzy taking over has made there since.
 socket_inode: ?std.Io.File.INode = null,
@@ -123,7 +126,7 @@ pub fn stop(self: *Server) void {
         for (self.conns.items) |c| if (!c.done.load(.acquire)) c.stream.shutdown(self.io, .both) catch {};
     }
     // Wake the thread waiting to accept.
-    if (self.wake_pipe[1] >= 0) {
+    if (has_wake_pipe and self.wake_pipe[1] >= 0) {
         _ = std.c.write(self.wake_pipe[1], "x", 1);
     } else if (Io.net.UnixAddress.init(self.socket_path)) |addr| {
         // No pipe: a thread in `accept` wakes when someone connects, so be that someone.
@@ -131,7 +134,7 @@ pub fn stop(self: *Server) void {
     } else |_| {}
     if (self.thread) |t| t.join();
     self.thread = null;
-    for (&self.wake_pipe) |*fd| if (fd.* >= 0) {
+    if (has_wake_pipe) for (&self.wake_pipe) |*fd| if (fd.* >= 0) {
         _ = std.c.close(fd.*);
         fd.* = -1;
     };
@@ -160,11 +163,11 @@ fn run(self: *Server) void {
         return;
     };
     if (Io.Dir.cwd().statFile(self.io, self.socket_path, .{})) |st| self.socket_inode = st.inode else |_| {}
-    if (comptime builtin.os.tag != .windows) {
+    if (has_wake_pipe) {
         if (std.c.pipe(&self.wake_pipe) != 0) self.wake_pipe = .{ -1, -1 };
     }
     while (!self.stopping.load(.acquire)) {
-        if (self.wake_pipe[0] >= 0) {
+        if (has_wake_pipe and self.wake_pipe[0] >= 0) {
             // Until someone connects, or `stop` writes to the pipe.
             var fds = [_]std.posix.pollfd{
                 .{ .fd = self.listener.?.socket.handle, .events = std.posix.POLL.IN, .revents = 0 },
