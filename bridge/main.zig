@@ -86,6 +86,16 @@ const tools = [_]Tool{
         \\  {"click": {"tag": "fizzy.window:dialog:Unsaved changes", "x": 40, "y": 60}}
         \\      (a tag and a point: that far from its top left — into a window by its tag)
         \\  {"double_click": {...}}  {"move": {...}}       (points as in fizzy_screen's rects)
+        \\  {"click": {"tag": "...", "fx": 0.25, "fy": 0.5}}  (a point as fractions of the widget)
+        \\  {"stroke": {"tag": "pixi.canvas:/p/a.pixi", "points": [{"fx": 0.1, "fy": 0.2},
+        \\      {"fx": 0.6, "fy": 0.2, "ms": 120}], "ms": 60}}
+        \\      (a pen's stroke: pressed at the first point, carried through the rest in straight
+        \\      lines, released at the last; "ms" a point's time from the last; one point is a dab.
+        \\      It is the person's pointer: for testing what a person does. To draw in a document
+        \\      beside them, use its plugin's commands, as pixi.draw's stroke)
+        \\  {"stroke": {"tag": "pixi.canvas:/p/a.pixi", "grid": [32, 32], "cells": [[4, 4], [27, 4]], "ms": 45}}
+        \\      (the same, in cells of the widget seen as a grid: a sprite's pixels; "ms" a cell)
+        \\  {"click": {"tag": "...", "grid": [32, 32], "cell": [4, 4]}}  (a cell's middle)
         \\  {"type": "text to type"}
         \\  {"key": "mod+s"}  (chords as the keymap spells them; "mod" is cmd on macOS, ctrl elsewhere)
         \\  {"wait_for": "tag"}  (until that widget is drawn)
@@ -107,7 +117,7 @@ const tools = [_]Tool{
         \\call each. Steps run in order; each is an object with one key. Input and waits play as a
         \\person's would (a click of theirs stops the run):
         \\  {"click": {"tag": "..."}} or {"click": {"x": 120, "y": 340}}, {"double_click": ...},
-        \\  {"move": ...}, {"type": "text"}, {"key": "mod+s"}, {"command": "id"},
+        \\  {"move": ...}, {"stroke": ...} (as fizzy_act's), {"type": "text"}, {"key": "mod+s"}, {"command": "id"},
         \\  {"wait_for": "tag"}, {"wait_gone": "tag"}
         \\The rest run between them:
         \\  {"call": {"id": "text.write", "args": {...}}}  a command with arguments; its result is reported
