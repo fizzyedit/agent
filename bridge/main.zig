@@ -589,7 +589,7 @@ pub const Bridge = struct {
         const b64 = try arena.alloc(u8, std.base64.standard.Encoder.calcSize(png.len));
         _ = std.base64.standard.Encoder.encode(b64, png);
         const note = try std.fmt.allocPrint(arena, "{s}\n{d}x{d} (from {d}x{d}); fizzy {d} ms, here {d} ms, {d} KiB", .{
-            path,                       size.w,                     size.h, cw, ch,
+            path,                           size.w,                         size.h,         cw, ch,
             (t1 - t0) / std.time.ns_per_ms, (t2 - t1) / std.time.ns_per_ms, png.len / 1024,
         });
         return reply(out, id, .{ .result = .{
