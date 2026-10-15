@@ -44,6 +44,18 @@ pub const Step = union(enum) {
     click: Point,
     double_click: Point,
     move: Point,
+    /// Press at the first point, carry through the rest in straight lines at an even pace, release
+    /// at the last: a pen's stroke. `tag` is the tag of every point that names none — a canvas, its
+    /// points as fractions of it (`fx`, `fy`). Each point's `ms` is the pen's time from the last
+    /// (`ms` here when it gives none); one point is a dab. Or, with `grid`, the points are `cells`
+    /// of the tagged widget seen as that grid (a sprite's pixels), the pen taking `ms` a cell.
+    stroke: struct {
+        tag: []const u8 = "",
+        points: []const Point = &.{},
+        ms: u32 = 60,
+        grid: ?[2]f32 = null,
+        cells: []const [2]f32 = &.{},
+    },
     type: []const u8,
     /// A chord as the keymap spells it: "mod+s", "escape".
     key: []const u8,
@@ -69,7 +81,7 @@ pub const Step = union(enum) {
 
     fn isTape(self: Step) bool {
         return switch (self) {
-            .click, .double_click, .move, .type, .key, .command, .wait_for, .wait_gone => true,
+            .click, .double_click, .move, .stroke, .type, .key, .command, .wait_for, .wait_gone => true,
             else => false,
         };
     }
@@ -79,11 +91,22 @@ pub const Point = struct {
     tag: []const u8 = "",
     x: ?f32 = null,
     y: ?f32 = null,
+    /// Where in the tagged widget, as fractions of it: 0.5, 0.5 is its middle. Then `x`, `y`, if
+    /// given, nudge from there.
+    fx: ?f32 = null,
+    fy: ?f32 = null,
+    /// In a stroke: the pen's time to here from the last point.
+    ms: ?u32 = null,
+    /// The tagged widget as a grid of this many cells across and down, and the cell aimed at (its
+    /// middle): a sprite's pixels, a board's squares.
+    grid: ?[2]f32 = null,
+    cell: ?[2]f32 = null,
 };
 
 const Waiting = union(enum) {
     none,
-    tape: struct { ticket: Automation.Ticket, last: usize, deadline: i96 },
+    /// `ended_in`: the frame the tape was first seen finished in.
+    tape: struct { ticket: Automation.Ticket, last: usize, deadline: i96, ended_in: ?i128 = null },
     settle: i96,
     screen: Automation.SnapshotTicket,
     profile: struct { until: i96, drive: bool },
@@ -184,9 +207,17 @@ fn poll(self: *Run, host: *sdk.Host, auto: *Automation) bool {
     const w = &self.report.writer;
     switch (self.waiting) {
         .none, .anchors => return true,
-        .tape => |t| {
+        .tape => |*t| {
             const o = auto.outcome(t.ticket);
             if (o == .playing and now() < t.deadline) return false;
+            // A tape's last input is handled in the frame after it ends, by whoever it is for: a
+            // step run sooner (a colour set, a command) would act before the stroke it follows
+            // has finished landing.
+            const frame = dvui.currentWindow().frame_time_ns;
+            if (o == .finished and (t.ended_in orelse frame) == frame) {
+                t.ended_in = frame;
+                return false;
+            }
             if (o == .playing) auto.stop(t.ticket);
             switch (o) {
                 .finished => w.print("        .{{ .steps = .{{ {d}, {d} }}, .played = true }},\n", .{ self.at, t.last }) catch {},
@@ -358,6 +389,23 @@ fn playTape(self: *Run, auto: *Automation, steps: []const Step) !Automation.Tick
         .click => |p| try s.click(target(p, win), .{}),
         .double_click => |p| try s.click(target(p, win), .{ .double = true }),
         .move => |p| try s.moveTo(target(p, win), .{}),
+        .stroke => |st| {
+            const cells = try arena.alloc(Point, if (st.grid != null) st.cells.len else 0);
+            for (cells, 0..) |*c, i| {
+                // A cell's time is the pen's at `ms` a cell, the longer way of the two.
+                const d: f32 = if (i == 0) 0 else @max(@abs(st.cells[i][0] - st.cells[i - 1][0]), @abs(st.cells[i][1] - st.cells[i - 1][1]));
+                c.* = .{ .grid = st.grid, .cell = st.cells[i], .ms = if (i == 0) null else @max(40, @as(u32, @intFromFloat(d)) * st.ms) };
+            }
+            const given = if (st.grid != null) cells else st.points;
+            const points = try arena.alloc(Script.StrokePoint, given.len);
+            for (given, points, 0..) |p, *sp, i| {
+                var at = p;
+                if (at.tag.len == 0) at.tag = st.tag;
+                // The first is the glide to where the pen goes down.
+                sp.* = .{ .at = target(at, win), .ms = p.ms orelse if (i == 0) s.pace.move_ms else st.ms };
+            }
+            try s.stroke(points, .{});
+        },
         .type => |t| try s.typeText(t, .{}),
         .key => |k| try s.key(k),
         .command => |id| try s.command(id),
@@ -377,10 +425,14 @@ fn playTape(self: *Run, auto: *Automation, steps: []const Step) !Automation.Tick
 
 fn target(p: Point, win: dvui.Rect.Physical) Tape.Target {
     if (p.tag.len > 0) {
-        // Its middle, or a point from its top left: physical pixels, which a tape nudges by in
-        // natural ones.
-        if (p.x == null and p.y == null) return .{ .tag = p.tag };
+        // Its middle, a fraction of it, or a point from its top left: physical pixels, which a
+        // tape nudges by in natural ones.
         const s = dvui.windowNaturalScale();
+        if (p.grid) |g| if (p.cell) |c|
+            return .{ .tag = p.tag, .x = (c[0] + 0.5) / g[0], .y = (c[1] + 0.5) / g[1] };
+        if (p.fx != null or p.fy != null)
+            return .{ .tag = p.tag, .x = p.fx orelse 0.5, .y = p.fy orelse 0.5, .dx = (p.x orelse 0) / s, .dy = (p.y orelse 0) / s };
+        if (p.x == null and p.y == null) return .{ .tag = p.tag };
         return .{ .tag = p.tag, .x = 0, .y = 0, .dx = (p.x orelse 0) / s, .dy = (p.y orelse 0) / s };
     }
     return .{ .x = (p.x orelse 0) / @max(win.w, 1), .y = (p.y orelse 0) / @max(win.h, 1) };
