@@ -752,10 +752,12 @@ const instructions =
     \\
     \\Make and change documents with their plugins' commands. fizzy_commands lists them all, a line
     \\each; read a plugin's in full by its prefix ("pixi.", "text.") and run them with fizzy_call.
-    \\Say everything a command needs in its arguments (the layer, the colour, the region) rather
-    \\than changing the person's tool, colours or selection, and never draw, type into or edit a
-    \\document by clicking with fizzy_act: the pointer is theirs. Keep fizzy_act for what no command
-    \\does, and look with fizzy_screen and fizzy_capture.
+    \\A plugin with a guide (a command "<plugin>.guide", as pixi.guide) wants it read before you
+    \\work in it: it says how the plugin's commands are meant to be used. Say everything a command
+    \\needs in its arguments (the layer, the colour, the region) rather than changing the person's
+    \\tool, colours or selection, and never draw, type into or edit a document by clicking with
+    \\fizzy_act: the pointer is theirs. Keep fizzy_act for what no command does, and look with
+    \\fizzy_screen and fizzy_capture.
     \\
     \\Your first command on a document opens it beside the person, who keeps working in it with
     \\you: nothing you do takes it from them, so look again before each step. When you are done,
