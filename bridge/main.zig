@@ -164,14 +164,15 @@ const tools = [_]Tool{
         .calls = "commands.list",
         .description =
         \\The commands fizzy's plugins offer — the agent's API to each plugin. With no prefix, an
-        \\index, a line per command: its id and title, and "(not now)" when it cannot run. With a prefix (a plugin's id
-        \\and a dot, as "pixi.", or a whole id), those commands in full: their parameters too (kind,
-        \\description, default, choices, range). Find what you need in the index, then read that
-        \\plugin's commands by prefix before calling them.
+        \\index, a line per command: its id and title, and "(not now)" when it cannot run. With a
+        \\prefix (a command's whole id, as "pixi.draw", or a plugin's id and a dot), those commands
+        \\in full: their parameters too (kind, description, default, choices, range). Find what you
+        \\need in the index, read a plugin's guide if it has one, then read the commands you will
+        \\call one by one, by their ids: a whole plugin's in full runs to tens of kilobytes.
         ,
         .schema =
         \\{"type":"object","properties":{
-        \\"prefix":{"type":"string","description":"A plugin's id and a dot (\"pixi.\"), or a command's id"}}}
+        \\"prefix":{"type":"string","description":"A command's id (\"pixi.draw\"), or a plugin's id and a dot (\"pixi.\")"}}}
         ,
     },
     .{
@@ -751,7 +752,8 @@ const instructions =
     \\the way a person does, so the person watching sees each step.
     \\
     \\Make and change documents with their plugins' commands. fizzy_commands lists them all, a line
-    \\each; read a plugin's in full by its prefix ("pixi.", "text.") and run them with fizzy_call.
+    \\each; read the ones you will call in full by their ids ("pixi.draw") and run them with
+    \\fizzy_call.
     \\A plugin with a guide (a command "<plugin>.guide", as pixi.guide) wants it read before you
     \\work in it: it says how the plugin's commands are meant to be used. Say everything a command
     \\needs in its arguments (the layer, the colour, the region) rather than changing the person's
