@@ -248,7 +248,7 @@ const tools = [_]Tool{
     .{
         .name = "fizzy_release",
         .calls = "doc.release",
-        .description = "Let go of the documents you are working on, when you are done: the person's input reaches them again. With no arguments, every one you hold; or one, by its path or its claim. Answers .{ .tapes }: each session recorded, the document as you took it and then each command that changed it, which the person plays back (and rewinds) with fizzy.demo.playTape.",
+        .description = "End your session on the documents you worked on, when you are done (and let go of any you held with fizzy_claim). With no arguments, every one; or one, by its path or its claim. Answers .{ .tapes }: each session recorded, the document as you found it and then each command that changed it, which the person plays back (and rewinds) with fizzy.demo.playTape.",
         .schema =
         \\{"type":"object","properties":{"path":{"type":"string"},"claim":{"type":"integer"}}}
         ,
@@ -753,15 +753,17 @@ const instructions =
     \\Make and change documents with their plugins' commands. fizzy_commands lists them all, a line
     \\each; read a plugin's in full by its prefix ("pixi.", "text.") and run them with fizzy_call.
     \\A plugin with a guide (a command "<plugin>.guide", as pixi.guide) wants it read before you
-    \\work in it: it says how the plugin's commands are meant to be used. One command does what
-    \\takes a person many clicks (pixi.draw's stroke is a pen's whole stroke), so never draw, type
-    \\into or edit a document by clicking with fizzy_act. Keep fizzy_act for what no command does,
-    \\and look with fizzy_screen and fizzy_capture.
+    \\work in it: it says how the plugin's commands are meant to be used. Say everything a command
+    \\needs in its arguments (the layer, the colour, the region) rather than changing the person's
+    \\tool, colours or selection, and never draw, type into or edit a document by clicking with
+    \\fizzy_act: the pointer is theirs. Keep fizzy_act for what no command does, and look with
+    \\fizzy_screen and fizzy_capture.
     \\
-    \\Your first command on a document takes it: it shows beside the person, they see it worked
-    \\on, and their input to it waits. When you are done, call fizzy_release: the person gets the
-    \\document back, and your session as a tape they can play and rewind. Left alone for a minute
-    \\it is let go by itself. Measure with fizzy_profile rather than adding logging.
+    \\Your first command on a document opens it beside the person, who keeps working in it with
+    \\you: nothing you do takes it from them, so look again before each step. When you are done,
+    \\call fizzy_release: your session becomes a tape they can play and rewind. Hold a document
+    \\with fizzy_claim only for work that cannot share it. Measure with fizzy_profile rather than
+    \\adding logging.
 ;
 
 fn listTools(out: *Io.Writer, id: json.Value) !void {
