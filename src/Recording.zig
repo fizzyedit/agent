@@ -41,10 +41,16 @@ const gap_ms = 150;
 const lead_ms = 800;
 
 pub fn start(gpa: std.mem.Allocator, doc: sdk.DocHandle, path: []const u8, label: []const u8, unix_s: i64) !Recording {
-    const bytes = (try doc.owner.documentBytes(doc, path, gpa)) orelse return error.NotRecordable;
+    // The name the bytes are written under says their format: the document's own path, or for one
+    // never saved (`untitled-1`, which names none) the name Save As offers (`untitled.pixi`). Under
+    // its title an untitled document gave no bytes, and its session recorded nothing.
+    const bytes_path = try doc.owner.bytesPath(doc, gpa);
+    defer gpa.free(bytes_path);
+    const bytes = (try doc.owner.documentBytes(doc, bytes_path, gpa)) orelse return error.NotRecordable;
     errdefer gpa.free(bytes);
-    const base = std.fs.path.basename(path);
-    const stem = base[0 .. base.len - std.fs.path.extension(base).len];
+    const stem = std.fs.path.stem(std.fs.path.basename(path));
+    // The tape's copy is opened by that name, so the owner that reads it is the one that wrote it.
+    const base = std.fs.path.basename(bytes_path);
     const name = try std.fmt.allocPrint(gpa, "{s}-{d}", .{ stem, unix_s });
     errdefer gpa.free(name);
     for (name) |*c| {
@@ -104,7 +110,8 @@ pub fn empty(self: *const Recording) bool {
 
 /// The tape, written as `<dir>/<name>.tape` (the binary form). Returns its path.
 pub fn write(self: *Recording, dir: []const u8, io: std.Io) ![]u8 {
-    const base = std.fs.path.basename(self.path);
+    // The name it was recorded under (`start`): an untitled document's has its format's extension.
+    const base = std.fs.path.basename(self.mount_path);
     var ops: std.ArrayListUnmanaged(Tape.Op) = .empty;
     defer ops.deinit(self.gpa);
     try ops.append(self.gpa, .{ .at = 0, .do = .{ .keyframe = 0 } });
