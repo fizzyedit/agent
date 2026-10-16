@@ -25,6 +25,8 @@ const Automation = sdk.services.automation.Api;
 
 gpa: std.mem.Allocator,
 arena: std.heap.ArenaAllocator,
+/// The connection that asked: its check's `call` steps are that agent's (`Run.conn`).
+conn: u32,
 args: Args,
 id: []const u8,
 argv: []const []const u8,
@@ -55,7 +57,7 @@ pub const Args = struct {
 };
 
 /// Start building the plugin `source` (ZON: `Args`) names. Errors say what was wrong with it.
-pub fn start(gpa: std.mem.Allocator, host: *sdk.Host, plugins: *Plugins, source: [:0]const u8) !*Build {
+pub fn start(gpa: std.mem.Allocator, host: *sdk.Host, plugins: *Plugins, conn: u32, source: [:0]const u8) !*Build {
     var arena: std.heap.ArenaAllocator = .init(gpa);
     errdefer arena.deinit();
     const a = arena.allocator();
@@ -86,6 +88,7 @@ pub fn start(gpa: std.mem.Allocator, host: *sdk.Host, plugins: *Plugins, source:
     errdefer gpa.destroy(self);
     self.* = .{
         .gpa = gpa,
+        .conn = conn,
         .arena = arena,
         .args = args,
         .id = id,
@@ -248,7 +251,7 @@ fn checkOrFinish(self: *Build, host: *sdk.Host, auto: ?*Automation) ?[]const u8 
     // `Run.Step` nests (a `compare` holds steps), so the serializer is given a depth to stop at.
     std.zon.stringify.serializeMaxDepth(Run.Args{ .steps = self.args.check }, .{ .emit_default_optional_fields = false }, &src.writer, 32) catch return self.fail("could not write the check");
     const zon = self.arena.allocator().dupeZ(u8, src.written()) catch return self.fail("out of memory");
-    const r = Run.init(self.gpa, zon) catch return self.fail("the check is not a script ui.run takes");
+    const r = Run.init(self.gpa, self.conn, zon) catch return self.fail("the check is not a script ui.run takes");
     self.phase = .{ .checking = r };
     const report = r.advance(host, auto.?) orelse return null;
     return self.finishCheck(report);

@@ -16,8 +16,8 @@
 //! | `ui.act` | `.{ .steps, .snapshot, .timeout_ms }` | input played as a person's, then (by default) the screen |
 //! | `tape.play` / `tape.outcome` | a live tape / `.{ .ticket }` | a ticket / how it ended |
 //! | `profile.report` | `.{ .ms }` | the profiler's report after `ms` of frames: per plugin, per scope |
-//! | `doc.claim` | `.{ .path, .label }` | a claim on an open document (`sdk.Claim`): the person's input to it waits until `doc.release`, the connection closes, a quiet minute (`idle_ns`), or they press Stop. `commands.call` claims a command's document itself, before the command runs (`target`) |
-//! | `doc.release` | `.{ .claim }`, `.{ .path }`, or neither for all the connection holds | `.{ .tapes }`: the sessions it recorded (`Recording`) |
+//! | `doc.claim` | `.{ .path, .label }` | a claim on an open document (`sdk.Claim`): the person's input to it waits until `doc.release`, the connection closes, or they press Stop. For work that cannot share the document; an agent's commands do not need one |
+//! | `doc.release` | `.{ .claim }`, `.{ .path }`, or neither for every session the connection has | `.{ .tapes }`: the sessions it recorded (`Recording`) |
 const std = @import("std");
 const sdk = @import("fizzy_sdk");
 const dvui = @import("dvui");
@@ -57,21 +57,19 @@ fn ms(n: u32) i96 {
 /// The agent plugin itself, which claims documents (`doc.claim`). Set by `plugin.zig`.
 pub var owner: ?*sdk.Plugin = null;
 
-/// Documents claimed for a connection. UI thread only.
+/// A connection's work on a document, from its first command on it: recorded as it goes, and
+/// written as a tape when it ends (`doc.release`, the connection closing, the document closing).
+/// It takes nothing from the person: they keep working in the document, and the plugins that own
+/// it keep the two from colliding (pixi waits out a stroke of theirs). A `claim` only when the
+/// agent asked to hold the document (`doc.claim`). UI thread only.
 var held: std.ArrayListUnmanaged(Held) = .empty;
 const Held = struct {
-    claim: u32,
     conn: u32,
     path: []u8,
-    /// When the connection last ran a command on it: a claim left alone `idle_ns` lets go.
-    last: i96,
-    /// The session on it so far, written as a tape when the claim ends.
+    claim: ?u32 = null,
+    /// The session on it so far, written as a tape when it ends.
     rec: ?Recording = null,
 };
-
-/// How long a claim stays with no command from its connection: an agent that has finished but
-/// not said so (`doc.release`) gives the document back, and its session becomes a tape.
-const idle_ns: i96 = 60 * std.time.ns_per_s;
 
 /// What a connection should hear with its next answer: a claim the person stopped.
 var notices: std.ArrayListUnmanaged(struct { conn: u32, text: []u8 }) = .empty;
@@ -109,7 +107,7 @@ pub fn deinit(host: *sdk.Host, server: *Server) void {
     }
     waiting.deinit(host.allocator);
     for (held.items) |*h| {
-        host.releaseClaim(h.claim);
+        if (h.claim) |c| host.releaseClaim(c);
         if (finish(host, h)) |tape| host.allocator.free(tape);
         host.allocator.free(h.path);
     }
@@ -118,20 +116,21 @@ pub fn deinit(host: *sdk.Host, server: *Server) void {
     notices.deinit(host.allocator);
 }
 
-/// Let go of what closed connections held, and turn claims the person stopped into a notice for
-/// the connection that made them.
+/// End the sessions of closed connections and on closed documents, and turn claims the person
+/// stopped into a notice for the connection that made them. Nothing here waits on a clock: a
+/// session ends when something happens.
 fn tendClaims(host: *sdk.Host, server: *Server, closed: []const u32) void {
     var i: usize = 0;
     while (i < held.items.len) {
         const h = &held.items[i];
-        const gone = std.mem.indexOfScalar(u32, closed, h.conn) != null;
-        if (gone or now() - h.last > idle_ns) {
-            host.releaseClaim(h.claim);
+        const gone = std.mem.indexOfScalar(u32, closed, h.conn) != null or host.docFromPath(h.path) == null;
+        if (gone) {
+            if (h.claim) |c| host.releaseClaim(c);
             if (finish(host, h)) |tape| {
                 std.log.info("agent: the session on {s} is a tape: {s}", .{ h.path, tape });
                 host.allocator.free(tape);
             }
-        } else if (!host.claimHolds(h.claim)) {
+        } else if (h.claim != null and !host.claimHolds(h.claim.?)) {
             const tape = finish(host, h);
             defer if (tape) |t| host.allocator.free(t);
             const text = std.fmt.allocPrint(server.gpa, "the person pressed Stop on {s}: leave it be, and ask before claiming it again.{s}{s}", .{ h.path, if (tape != null) " The session so far is a tape: " else "", tape orelse "" }) catch null;
@@ -159,35 +158,51 @@ fn claim(host: *sdk.Host, server: *Server, req: *Server.Request, arena: std.mem.
     const a = parse(struct { path: []const u8, label: []const u8 = "An agent" }, arena, source) orelse
         return req.answer(server, false, "doc.claim takes .{ .path, .label }");
     const doc = host.docFromPath(a.path) orelse return req.answer(server, false, "that document is not open: open it first (fizzy.openFiles)");
-    const id = hold(host, req.conn, doc, a.label) catch |err| return req.answer(server, false, switch (err) {
-        error.DocumentClaimed => "someone else is working on that document",
-        error.NotRegistered => "the agent plugin is not registered",
+    const me = owner orelse return req.answer(server, false, "the agent plugin is not registered");
+    const h = session(host, req.conn, doc, a.label) catch return req.answer(server, false, "out of memory");
+    const id = h.claim orelse host.claimDocument(me, doc.id, a.label) catch |err| return req.answer(server, false, switch (err) {
+        error.DocumentClaimed => "someone else is holding that document",
         else => "out of memory",
     });
+    h.claim = id;
     req.answer(server, true, std.fmt.allocPrint(arena, ".{{ .claim = {d} }}", .{id}) catch "?");
 }
 
-/// Claim `doc` for connection `conn`, and record what it does to it from now on; the claim it
-/// already has, if any.
-fn hold(host: *sdk.Host, conn: u32, doc: sdk.DocHandle, label: []const u8) !u32 {
-    const me = owner orelse return error.NotRegistered;
-    const id = try host.claimDocument(me, doc.id, label);
-    for (held.items) |*h| if (h.claim == id) {
-        h.last = now();
-        return id;
+/// Run command `id` as connection `conn`'s step, as `commands.call` and a run's `call` steps both
+/// do: the session on the document it works on begins before it runs (shown beside the person,
+/// its tape starting from the document as it was), and the step goes into that session's tape,
+/// not into every one the connection has.
+pub fn agentCall(host: *sdk.Host, conn: u32, id: []const u8, args: []const u8, arena: std.mem.Allocator) sdk.Host.CommandOutcome {
+    const doc_path: ?[]const u8 = if (target(host, id, arena.dupeZ(u8, args) catch "", arena)) |doc| blk: {
+        const h = session(host, conn, doc, "An agent") catch break :blk null;
+        break :blk arena.dupe(u8, h.path) catch null;
+    } else null;
+    // What the command opens or creates lands beside the person, not over their document.
+    host.openBeside();
+    const out = host.callCommand(id, args, arena);
+    host.endOpenBeside();
+    if (out == .ok) if (doc_path) |p| for (held.items) |*h| {
+        if (h.conn != conn or !eql(h.path, p)) continue;
+        if (h.rec) |*rec| rec.note(id, args, host.last_showing_ms) catch {};
     };
-    const path = try host.allocator.dupe(u8, doc.owner.documentPath(doc));
+    return out;
+}
+
+/// Connection `conn`'s session on `doc`: the one it has, or a new one, recorded from now on and
+/// shown beside the person (`OpenOptions.beside`), who keeps the pane they are in.
+fn session(host: *sdk.Host, conn: u32, doc: sdk.DocHandle, label: []const u8) !*Held {
+    const doc_path = doc.owner.documentPath(doc);
+    for (held.items) |*h| if (h.conn == conn and eql(h.path, doc_path)) return h;
+    const path = try host.allocator.dupe(u8, doc_path);
     errdefer host.allocator.free(path);
     const unix_s: i64 = @intCast(@divTrunc(std.Io.Clock.real.now(dvui.io).nanoseconds, std.time.ns_per_s));
     const rec = Recording.start(host.allocator, doc, path, label, unix_s) catch |err| blk: {
-        std.log.info("agent: {s} is held but not recorded: {t}", .{ path, err });
+        std.log.info("agent: {s} is worked on but not recorded: {t}", .{ path, err });
         break :blk null;
     };
-    held.append(host.allocator, .{ .claim = id, .conn = conn, .path = path, .last = now(), .rec = rec }) catch |err| {
-        host.releaseClaim(id);
-        return err;
-    };
-    return id;
+    try held.append(host.allocator, .{ .conn = conn, .path = path, .rec = rec });
+    _ = host.openFile(.{ .path = path, .beside = true }) catch {};
+    return &held.items[held.items.len - 1];
 }
 
 /// The open document a command is about to work on: the one its `path` argument names, or else
@@ -212,7 +227,7 @@ fn release(host: *sdk.Host, server: *Server, req: *Server.Request, arena: std.me
             i += 1;
             continue;
         }
-        host.releaseClaim(h.claim);
+        if (h.claim) |c| host.releaseClaim(c);
         if (finish(host, h)) |t| {
             tapes.append(arena, arena.dupe(u8, t) catch t) catch {};
             host.allocator.free(t);
@@ -276,18 +291,8 @@ fn handle(host: *sdk.Host, server: *Server, req: *Server.Request) void {
     if (eql(tool, "commands.call")) {
         const a = parse(struct { id: []const u8, args: []const u8 = "" }, arena, source) orelse
             return req.answer(server, false, "commands.call takes .{ .id, .args = \"<ZON>\" }");
-        // Held before it runs, so the person's input waits and the tape starts from the
-        // document as it was. Someone else's claim leaves it unheld; the command still runs.
-        if (target(host, a.id, arena.dupeZ(u8, a.args) catch "", arena)) |doc| _ = hold(host, req.conn, doc, "An agent") catch null;
-        return switch (host.callCommand(a.id, a.args, arena)) {
-            .ok => |r| {
-                for (held.items) |*h| {
-                    if (h.conn != req.conn) continue;
-                    h.last = now();
-                    if (h.rec) |*rec| rec.note(a.id, a.args, host.last_showing_ms) catch {};
-                }
-                req.answer(server, true, r orelse "null");
-            },
+        return switch (agentCall(host, req.conn, a.id, a.args, arena)) {
+            .ok => |r| req.answer(server, true, r orelse "null"),
             .unknown => req.answer(server, false, "no command by that id (commands.list)"),
             .disabled => req.answer(server, false, "that command is not enabled now"),
             .bad_args => |m| req.answer(server, false, m),
@@ -315,7 +320,7 @@ fn handle(host: *sdk.Host, server: *Server, req: *Server.Request) void {
     if (eql(tool, "ui.run")) return run(host, server, req, auto, source);
     if (eql(tool, "plugin.build")) {
         const plugins = host.getServiceTyped(sdk.services.plugins.Api) orelse return req.answer(server, false, "this app offers no plugins service (fizzy's SDK 0.2.22 or later)");
-        const b = Build.start(host.allocator, host, plugins, source) catch |err| return req.answer(server, false, switch (err) {
+        const b = Build.start(host.allocator, host, plugins, req.conn, source) catch |err| return req.answer(server, false, switch (err) {
             error.BadArguments => "plugin.build takes .{ .path = \"<plugin directory>\", .optimize, .check = .{ <ui.run steps> }, .timeout_ms }",
             error.PathNotAbsolute => "give the plugin's directory as an absolute path",
             error.NoPluginZon => "no plugin.zig.zon with an id in that directory",
@@ -454,7 +459,7 @@ fn check(host: *sdk.Host, server: *Server, w: *Waiting) bool {
 
 /// `ui.run`: a script, run across frames, answered with one report (`Run.zig`).
 fn run(host: *sdk.Host, server: *Server, req: *Server.Request, auto: *Automation, source: [:0]const u8) void {
-    const r = Run.init(host.allocator, source) catch |err| return req.answer(server, false, switch (err) {
+    const r = Run.init(host.allocator, req.conn, source) catch |err| return req.answer(server, false, switch (err) {
         error.BadScript => "ui.run takes .{ .steps = .{ .{ .click = .{ .tag = \"...\" } }, .{ .call = .{ .id, .args } }, .{ .expect = .{ .tag } }, .{ .settle = .{} }, .{ .screen = .{} }, .{ .profile = .{ .ms } }, ... }, .timeout_ms }",
         error.OutOfMemory => "out of memory",
     });
