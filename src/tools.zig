@@ -173,6 +173,11 @@ fn claim(host: *sdk.Host, server: *Server, req: *Server.Request, arena: std.mem.
 /// its tape starting from the document as it was), and the step goes into that session's tape,
 /// not into every one the connection has.
 pub fn agentCall(host: *sdk.Host, conn: u32, id: []const u8, args: []const u8, arena: std.mem.Allocator) sdk.Host.CommandOutcome {
+    if (undoesAnother(host, conn, id)) |active| return .{ .failed = std.fmt.allocPrint(
+        arena,
+        "{s} acts on the active document, {s}, which is not one you are working on: it would take back the person's steps. Take back your own by clearing what you drew and drawing it again.",
+        .{ id, active },
+    ) catch "undo acts on the active document, which is not yours" };
     const doc_path: ?[]const u8 = if (target(host, id, arena.dupeZ(u8, args) catch "", arena)) |doc| blk: {
         const h = session(host, conn, doc, "An agent") catch break :blk null;
         break :blk arena.dupe(u8, h.path) catch null;
@@ -186,6 +191,20 @@ pub fn agentCall(host: *sdk.Host, conn: u32, id: []const u8, args: []const u8, a
         if (h.rec) |*rec| rec.note(id, args, host.last_showing_ms) catch {};
     };
     return out;
+}
+
+/// Undo and redo (`fizzy.undo`, `pixi.redo`, ...) take no document: they act on the active one.
+/// When that is not one connection `conn` works on, it is the person's, and an agent's undo would
+/// take back their steps: answers its path, to refuse with. Until undo takes a `path`
+/// (`plans/SHARED_HISTORY_PLAN.md`, step 5), an agent undoes only its own document, and only
+/// while it is the active one.
+fn undoesAnother(host: *sdk.Host, conn: u32, id: []const u8) ?[]const u8 {
+    const action = id[if (std.mem.lastIndexOfScalar(u8, id, '.')) |dot| dot + 1 else 0..];
+    if (!eql(action, "undo") and !eql(action, "redo")) return null;
+    const doc = host.activeDoc() orelse return null;
+    const path = doc.owner.documentPath(doc);
+    for (held.items) |h| if (h.conn == conn and eql(h.path, path)) return null;
+    return path;
 }
 
 /// Connection `conn`'s session on `doc`: the one it has, or a new one, recorded from now on and
