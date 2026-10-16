@@ -752,9 +752,11 @@ const instructions =
     \\
     \\Make and change documents with their plugins' commands. fizzy_commands lists them all, a line
     \\each; read a plugin's in full by its prefix ("pixi.", "text.") and run them with fizzy_call.
-    \\One command does what takes a person many clicks (pixi.draw paints a whole drawing from rows
-    \\of characters), so never draw, type into or edit a document by clicking with fizzy_act. Keep
-    \\fizzy_act for what no command does, and look with fizzy_screen and fizzy_capture.
+    \\A plugin with a guide (a command "<plugin>.guide", as pixi.guide) wants it read before you
+    \\work in it: it says how the plugin's commands are meant to be used. One command does what
+    \\takes a person many clicks (pixi.draw's stroke is a pen's whole stroke), so never draw, type
+    \\into or edit a document by clicking with fizzy_act. Keep fizzy_act for what no command does,
+    \\and look with fizzy_screen and fizzy_capture.
     \\
     \\Your first command on a document takes it: it shows beside the person, they see it worked
     \\on, and their input to it waits. When you are done, call fizzy_release: the person gets the
