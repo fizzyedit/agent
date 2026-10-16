@@ -124,7 +124,7 @@ pub fn write(self: *Recording, dir: []const u8, io: std.Io) ![]u8 {
             .layout = .keep,
         }},
     };
-    const encoded = try tape.binary.encode(self.gpa, t);
+    const encoded = try tape.binary.encode(self.gpa, t, .{});
     defer self.gpa.free(encoded);
     std.Io.Dir.cwd().createDirPath(io, dir) catch {};
     const file_name = try std.fmt.allocPrint(self.gpa, "{s}.tape", .{self.name});
