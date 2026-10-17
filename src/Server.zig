@@ -18,7 +18,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const Io = std.Io;
 
-const has_wake_pipe = builtin.os.tag != .windows;
+const has_wake_pipe = builtin.target.os.tag != .windows;
 
 gpa: std.mem.Allocator,
 io: Io,
@@ -241,8 +241,9 @@ fn serve(self: *Server, stream: Io.net.Stream, conn_id: u32) void {
         defer arena.deinit();
         const a = arena.allocator();
         const line = takeLine(&reader.interface, a) catch return;
-        const source = a.dupeZ(u8, std.mem.trimEnd(u8, line, "\r")) catch return;
-        const wire = std.zon.parse.fromSliceAlloc(Wire.Request, a, source, null, .{ .ignore_unknown_fields = true }) catch {
+        const source = a.dupeSentinel(u8, std.mem.trimEnd(u8, line, "\r"), 0) catch return;
+        var diag: std.zon.parse.Diagnostics = undefined;
+        const wire = std.zon.parse.fromSlice(Wire.Request, .{ .gpa = a, .arena = a, .source = source, .diagnostics = &diag, .ignore_unknown_fields = true }) catch {
             respond(&writer.interface, .{ .id = 0, .err = "not a request: one ZON value per line, .{ .id, .tool, .args }" }) catch return;
             continue;
         };
