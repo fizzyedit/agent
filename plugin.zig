@@ -59,7 +59,7 @@ fn initPlugin(_: *anyopaque) anyerror!void {
     const socket_path = if (beside.len < 100) beside else blk: {
         gpa.free(beside);
         // Windows has no `/tmp`, and its process ids are not `pid_t`s.
-        if (comptime builtin.os.tag == .windows) {
+        if (comptime builtin.target.os.tag == .windows) {
             const temp = if (std.c.getenv("TEMP")) |t| std.mem.span(t) else return error.NoTempDir;
             break :blk try std.fmt.allocPrint(gpa, "{s}\\fizzy-agent-{d}.sock", .{ temp, std.os.windows.GetCurrentProcessId() });
         }
@@ -83,7 +83,7 @@ fn initPlugin(_: *anyopaque) anyerror!void {
 fn writeConnection(dir: []const u8, socket_path: []const u8, token: []const u8) !void {
     const path = try std.fmt.allocPrint(host.allocator, "{s}/connection.zon", .{dir});
     defer host.allocator.free(path);
-    const permissions: std.Io.File.Permissions = if (comptime builtin.os.tag == .windows) .default_file else .fromMode(0o600);
+    const permissions: std.Io.File.Permissions = if (comptime builtin.target.os.tag == .windows) .default_file else .fromMode(0o600);
     const file = try std.Io.Dir.cwd().createFile(dvui.io, path, .{ .permissions = permissions });
     defer file.close(dvui.io);
     var buf: [1024]u8 = undefined;

@@ -61,19 +61,20 @@ pub fn start(gpa: std.mem.Allocator, host: *sdk.Host, plugins: *Plugins, conn: u
     var arena: std.heap.ArenaAllocator = .init(gpa);
     errdefer arena.deinit();
     const a = arena.allocator();
-    const args = std.zon.parse.fromSliceAlloc(Args, a, source, null, .{ .ignore_unknown_fields = true }) catch return error.BadArguments;
+    var diag: std.zon.parse.Diagnostics = undefined;
+    const args = std.zon.parse.fromSlice(Args, .{ .gpa = a, .arena = a, .source = source, .diagnostics = &diag, .ignore_unknown_fields = true }) catch return error.BadArguments;
     if (!std.fs.path.isAbsolute(args.path)) return error.PathNotAbsolute;
 
     // Which plugin: its identity file, as the build helper reads it.
     const zon_path = try std.fs.path.join(a, &.{ args.path, "plugin.zig.zon" });
     const zon = std.Io.Dir.cwd().readFileAllocOptions(dvui.io, zon_path, a, .limited(64 * 1024), .of(u8), 0) catch return error.NoPluginZon;
     const Identity = struct { id: []const u8 };
-    const id = (std.zon.parse.fromSliceAlloc(Identity, a, zon, null, .{ .ignore_unknown_fields = true }) catch return error.NoPluginZon).id;
+    const id = (std.zon.parse.fromSlice(Identity, .{ .gpa = a, .arena = a, .source = zon, .diagnostics = &diag, .ignore_unknown_fields = true }) catch return error.NoPluginZon).id;
     if (std.mem.eql(u8, id, "agent")) return error.CannotBuildItself;
 
     const plugins_dir = host.plugins_dir orelse return error.NoPluginsDir;
     const profile = std.fs.path.dirname(plugins_dir) orelse plugins_dir;
-    const ext = switch (builtin.os.tag) {
+    const ext = switch (builtin.target.os.tag) {
         .macos => "dylib",
         .windows => "dll",
         else => "so",
@@ -153,7 +154,7 @@ fn build(self: *Build) void {
 }
 
 fn spawn(gpa: std.mem.Allocator, argv: []const []const u8, cwd: []const u8) !std.process.Child {
-    if (comptime builtin.os.tag == .macos) {
+    if (comptime builtin.target.os.tag == .macos) {
         return core.darwin_spawn.spawn(gpa, .{ .argv = argv, .cwd = cwd, .stdin = .discard, .stdout = .discard, .stderr = .pipe }, core.shell_env.path(gpa, dvui.io));
     }
     return std.process.spawn(dvui.io, .{ .argv = argv, .cwd = .{ .path = cwd }, .stdin = .ignore, .stdout = .ignore, .stderr = .pipe, .create_no_window = true });
@@ -250,7 +251,7 @@ fn checkOrFinish(self: *Build, host: *sdk.Host, auto: ?*Automation) ?[]const u8 
     var src: std.Io.Writer.Allocating = .init(self.arena.allocator());
     // `Run.Step` nests (a `compare` holds steps), so the serializer is given a depth to stop at.
     std.zon.stringify.serializeMaxDepth(Run.Args{ .steps = self.args.check }, .{ .emit_default_optional_fields = false }, &src.writer, 32) catch return self.fail("could not write the check");
-    const zon = self.arena.allocator().dupeZ(u8, src.written()) catch return self.fail("out of memory");
+    const zon = self.arena.allocator().dupeSentinel(u8, src.written(), 0) catch return self.fail("out of memory");
     const r = Run.init(self.gpa, self.conn, zon) catch return self.fail("the check is not a script ui.run takes");
     self.phase = .{ .checking = r };
     const report = r.advance(host, auto.?) orelse return null;

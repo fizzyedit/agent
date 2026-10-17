@@ -11,7 +11,7 @@ const core = @import("core");
 
 /// The timer that wakes fizzy when a measurement ends. One is enough: one measurement waits at a
 /// time per frame, and the latest deadline wins.
-const timer_id: dvui.Id = @enumFromInt(0x6167_6e74_6d65_6173); // "agntmeas"
+const timer_id: dvui.Id = @fromBackingInt(@intCast(0x6167_6e74_6d65_6173)); // "agntmeas"
 
 /// Ask for a frame at `until` (boot-clock nanoseconds), however idle fizzy is meanwhile. Called each
 /// frame while waiting, which also keeps the timer alive (dvui drops one nobody asks after).

@@ -320,7 +320,7 @@ fn takeLine(r: *Io.Reader, arena: std.mem.Allocator) ![]u8 {
 fn connectionPath(arena: std.mem.Allocator, env: *const std.process.Environ.Map, profile: ?[]const u8) ![]const u8 {
     const tail = [_][]const u8{ "plugins", "agent", "connection.zon" };
     if (profile) |p| return std.fs.path.join(arena, &.{ p, tail[0], tail[1], tail[2] });
-    const os = @import("builtin").os.tag;
+    const os = @import("builtin").target.os.tag;
     const base: []const u8 = switch (os) {
         .macos => try std.fs.path.join(arena, &.{ env.get("HOME") orelse return error.NoHome, "Library", "Application Support" }),
         .windows => env.get("LOCALAPPDATA") orelse return error.NoLocalAppData,
@@ -365,7 +365,8 @@ pub const Bridge = struct {
         const Connection = struct { socket: []const u8, token: []const u8 };
         const source = Io.Dir.cwd().readFileAllocOptions(self.io, self.connection_path, arena, .limited(64 * 1024), .of(u8), 0) catch
             return error.FizzyNotRunning;
-        const c = std.zon.parse.fromSliceAlloc(Connection, arena, source, null, .{ .ignore_unknown_fields = true }) catch
+        var diag: std.zon.parse.Diagnostics = undefined;
+        const c = std.zon.parse.fromSlice(Connection, .{ .gpa = arena, .arena = arena, .source = source, .diagnostics = &diag, .ignore_unknown_fields = true }) catch
             return error.BadConnectionFile;
         const addr = try Io.net.UnixAddress.init(c.socket);
         const stream = addr.connect(self.io) catch return error.FizzyNotRunning;
@@ -421,16 +422,18 @@ pub const Bridge = struct {
         if (!self.probe(arena)) {
             if (!self.reconnect(arena)) return null;
         }
-        const source = arena.dupeZ(u8, self.hello orelse return null) catch return null;
+        const source = arena.dupeSentinel(u8, self.hello orelse return null, 0) catch return null;
         const Hello = struct { executable: []const u8 = "" };
-        const h = std.zon.parse.fromSliceAlloc(Hello, arena, source, null, .{ .ignore_unknown_fields = true }) catch return null;
+        var diag: std.zon.parse.Diagnostics = undefined;
+        const h = std.zon.parse.fromSlice(Hello, .{ .gpa = arena, .arena = arena, .source = source, .diagnostics = &diag, .ignore_unknown_fields = true }) catch return null;
         return if (h.executable.len > 0) h.executable else null;
     }
 
     /// The token `connection.zon` holds now: a new one is a new fizzy.
     pub fn connectionToken(self: *Bridge, arena: std.mem.Allocator) ?[]const u8 {
         const source = Io.Dir.cwd().readFileAllocOptions(self.io, self.connection_path, arena, .limited(64 * 1024), .of(u8), 0) catch return null;
-        const c = std.zon.parse.fromSliceAlloc(struct { token: []const u8 }, arena, source, null, .{ .ignore_unknown_fields = true }) catch return null;
+        var diag: std.zon.parse.Diagnostics = undefined;
+        const c = std.zon.parse.fromSlice(struct { token: []const u8 }, .{ .gpa = arena, .arena = arena, .source = source, .diagnostics = &diag, .ignore_unknown_fields = true }) catch return null;
         return c.token;
     }
 
@@ -449,8 +452,9 @@ pub const Bridge = struct {
         try w.writeByte('\n');
         try w.flush();
         const line = try takeLine(&link.reader.interface, arena);
-        const source = try arena.dupeZ(u8, std.mem.trimEnd(u8, line, "\r"));
-        const r = try std.zon.parse.fromSliceAlloc(Wire.Response, arena, source, null, .{ .ignore_unknown_fields = true });
+        const source = try arena.dupeSentinel(u8, std.mem.trimEnd(u8, line, "\r"), 0);
+        var diag: std.zon.parse.Diagnostics = undefined;
+        const r = try std.zon.parse.fromSlice(Wire.Response, .{ .gpa = arena, .arena = arena, .source = source, .diagnostics = &diag, .ignore_unknown_fields = true });
         if (r.err) |e| return .{ .err = e };
         return .{ .ok = r.ok orelse "" };
     }
@@ -590,7 +594,7 @@ pub const Bridge = struct {
         const b64 = try arena.alloc(u8, std.base64.standard.Encoder.calcSize(png.len));
         _ = std.base64.standard.Encoder.encode(b64, png);
         const note = try std.fmt.allocPrint(arena, "{s}\n{d}x{d} (from {d}x{d}); fizzy {d} ms, here {d} ms, {d} KiB", .{
-            path,                       size.w,                     size.h, cw, ch,
+            path,                           size.w,                         size.h,         cw, ch,
             (t1 - t0) / std.time.ns_per_ms, (t2 - t1) / std.time.ns_per_ms, png.len / 1024,
         });
         return reply(out, id, .{ .result = .{
@@ -616,7 +620,8 @@ pub const Bridge = struct {
             rect: struct { x: f64 = 0, y: f64 = 0, w: f64 = 0, h: f64 = 0 } = .{},
             window: ?u32 = null,
         };
-        const nodes = try std.zon.parse.fromSliceAlloc([]const Node, arena, try arena.dupeZ(u8, text), null, .{ .ignore_unknown_fields = true });
+        var diag: std.zon.parse.Diagnostics = undefined;
+        const nodes = try std.zon.parse.fromSlice([]const Node, .{ .gpa = arena, .arena = arena, .source = try arena.dupeSentinel(u8, text, 0), .diagnostics = &diag, .ignore_unknown_fields = true });
         const node = for (nodes) |n| {
             if (std.mem.eql(u8, n.tag, tag)) break n;
         } else return error.NoSuchTag;
@@ -710,8 +715,9 @@ pub const Bridge = struct {
             .ok => |s| s,
             .err => return &.{},
         };
-        const source = arena.dupeZ(u8, list) catch return &.{};
-        const commands = std.zon.parse.fromSliceAlloc([]const Listed, arena, source, null, .{ .ignore_unknown_fields = true }) catch return &.{};
+        const source = arena.dupeSentinel(u8, list, 0) catch return &.{};
+        var diag: std.zon.parse.Diagnostics = undefined;
+        const commands = std.zon.parse.fromSlice([]const Listed, .{ .gpa = arena, .arena = arena, .source = source, .diagnostics = &diag, .ignore_unknown_fields = true }) catch return &.{};
         for (commands) |c| {
             if (!eql(c.id, id)) continue;
             var keys: std.ArrayListUnmanaged([]const u8) = .empty;
@@ -790,9 +796,9 @@ fn reply(out: *Io.Writer, id: json.Value, body: anytype) !void {
     const B = @TypeOf(body);
     try out.writeAll("{\"jsonrpc\":\"2.0\",\"id\":");
     try json.Stringify.value(id, .{}, out);
-    inline for (@typeInfo(B).@"struct".fields) |f| {
-        try out.writeAll(",\"" ++ f.name ++ "\":");
-        try json.Stringify.value(@field(body, f.name), .{}, out);
+    inline for (@typeInfo(B).@"struct".field_names, @typeInfo(B).@"struct".field_types, @typeInfo(B).@"struct".field_attrs) |f_name, _, _| {
+        try out.writeAll(",\"" ++ f_name ++ "\":");
+        try json.Stringify.value(@field(body, f_name), .{}, out);
     }
     try out.writeAll("}\n");
 }
@@ -871,7 +877,8 @@ test "JSON arguments read as ZON" {
     // And parse back as the plugin's types would.
     const Step = union(enum) { click: struct { tag: []const u8 }, type: []const u8, key: []const u8 };
     const Args = struct { steps: []const Step, snapshot: bool = true };
-    const parsed = try std.zon.parse.fromSliceAlloc(Args, a, try a.dupeZ(u8, w.written()), null, .{});
+    var diag: std.zon.parse.Diagnostics = undefined;
+    const parsed = try std.zon.parse.fromSlice(Args, .{ .gpa = a, .arena = a, .source = try a.dupeSentinel(u8, w.written(), 0), .diagnostics = &diag });
     try std.testing.expectEqualStrings("hi \"there\"\n", parsed.steps[1].type);
     try std.testing.expect(!parsed.snapshot);
 }
