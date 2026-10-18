@@ -1,7 +1,7 @@
 .{
     .name = .agent,
     .version = "0.1.0",
-    .minimum_zig_version = "0.16.0",
+    .minimum_zig_version = "0.17.0",
     .paths = .{ "build.zig", "build.zig.zon", "plugin.zig", "plugin.zig.zon", "src", "bridge", "README.md" },
     .fingerprint = 0x268b9c9dc0289c64,
     .dependencies = .{
@@ -10,8 +10,8 @@
             // clean clone, and the release asset (never the tag's git archive) is the SDK
             // package alone. To build against a local fizzy instead:
             // `zig build --fork=<fizzy checkout>/sdk`.
-            .url = "https://github.com/fizzyedit/fizzy/releases/download/sdk-v0.2.28/fizzy-sdk-v0.2.28.tar.gz",
-            .hash = "fizzy-0.2.28-SGBwY_PuJQCcliz1OqCE9VlJoS204IsAExXIg75ejXhx",
+            .url = "https://github.com/fizzyedit/fizzy/releases/download/sdk-v0.2.30/fizzy-sdk-v0.2.30.tar.gz",
+            .hash = "fizzy-0.2.30-SGBwY1QnJwDznUMVnSLATxXgH2e8_Vz7eMwLj9UQ0sVU",
         },
     },
 }
