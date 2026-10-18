@@ -137,7 +137,8 @@ pub const Args = struct {
 pub fn init(gpa: std.mem.Allocator, conn: u32, source: [:0]const u8) error{ BadScript, OutOfMemory }!*Run {
     var arena: std.heap.ArenaAllocator = .init(gpa);
     errdefer arena.deinit();
-    const args = std.zon.parse.fromSliceAlloc(Args, arena.allocator(), source, null, .{ .ignore_unknown_fields = true }) catch
+    var diag: std.zon.parse.Diagnostics = undefined;
+    const args = std.zon.parse.fromSlice(Args, .{ .gpa = arena.allocator(), .arena = arena.allocator(), .source = source, .diagnostics = &diag, .ignore_unknown_fields = true }) catch
         return error.BadScript;
     const self = try gpa.create(Run);
     self.* = .{ .arena = arena, .conn = conn, .steps = args.steps, .timeout_ms = args.timeout_ms, .report = .init(gpa) };

@@ -191,7 +191,7 @@ pub fn agentCall(host: *sdk.Host, conn: u32, id: []const u8, args: []const u8, a
         "{s} acts on the active document, {s}, which is not one you are working on: it would take back the person's steps. Take back your own by clearing what you drew and drawing it again.",
         .{ id, active },
     ) catch "undo acts on the active document, which is not yours" };
-    const doc_path: ?[]const u8 = if (target(host, id, arena.dupeZ(u8, args) catch "", arena)) |doc| blk: {
+    const doc_path: ?[]const u8 = if (target(host, id, arena.dupeSentinel(u8, args, 0) catch "", arena)) |doc| blk: {
         const h = session(host, conn, doc, author(conn).label) catch break :blk null;
         break :blk arena.dupe(u8, h.path) catch null;
     } else null;
@@ -306,7 +306,7 @@ fn handle(host: *sdk.Host, server: *Server, req: *Server.Request) void {
     var arena_state: std.heap.ArenaAllocator = .init(host.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    const source = arena.dupeZ(u8, req.args) catch return req.answer(server, false, "out of memory");
+    const source = arena.dupeSentinel(u8, req.args, 0) catch return req.answer(server, false, "out of memory");
     const tool = req.tool;
 
     if (eql(tool, "hello")) {
@@ -378,7 +378,7 @@ fn handle(host: *sdk.Host, server: *Server, req: *Server.Request) void {
     }
     if (eql(tool, "tape.play")) {
         return switch (auto.playAs(req.args, author(req.conn))) {
-            .started => |t| req.answer(server, true, std.fmt.allocPrint(arena, ".{{ .ticket = {d} }}", .{@intFromEnum(t)}) catch "?"),
+            .started => |t| req.answer(server, true, std.fmt.allocPrint(arena, ".{{ .ticket = {d} }}", .{@backingInt(t)}) catch "?"),
             .busy => req.answer(server, false, "something else is driving fizzy: a tape or a demo"),
             .invalid => |why| req.answer(server, false, why),
         };
@@ -386,7 +386,7 @@ fn handle(host: *sdk.Host, server: *Server, req: *Server.Request) void {
     if (eql(tool, "tape.outcome")) {
         const a = parse(struct { ticket: u32 }, arena, source) orelse return req.answer(server, false, "tape.outcome takes .{ .ticket }");
         var buf: [64]u8 = undefined;
-        return req.answer(server, true, outcomeText(&buf, auto.outcome(@enumFromInt(a.ticket))));
+        return req.answer(server, true, outcomeText(&buf, auto.outcome(@fromBackingInt(@intCast(a.ticket)))));
     }
     if (eql(tool, "profile.report")) {
         // `drive`: ask for every frame, to measure what drawing costs; else only the frames fizzy
@@ -531,7 +531,7 @@ fn act(host: *sdk.Host, server: *Server, req: *Server.Request, arena: std.mem.Al
     // `Run.Step` nests (a `compare` holds steps): the serializer is given a depth to stop at.
     std.zon.stringify.serializeMaxDepth(Run.Args{ .steps = steps.items, .timeout_ms = a.timeout_ms }, .{ .emit_default_optional_fields = false }, &out.writer, 32) catch
         return req.answer(server, false, "out of memory");
-    const zon = arena.dupeZ(u8, out.written()) catch return req.answer(server, false, "out of memory");
+    const zon = arena.dupeSentinel(u8, out.written(), 0) catch return req.answer(server, false, "out of memory");
     const auto = automation(host) orelse return req.answer(server, false, "this app offers no automation service");
     run(host, server, req, auto, zon);
 }
@@ -601,8 +601,9 @@ fn listCommands(host: *sdk.Host, server: *Server, req: *Server.Request, arena: s
 }
 
 fn parse(comptime T: type, arena: std.mem.Allocator, source: [:0]const u8) ?T {
-    if (source.len == 0) return std.zon.parse.fromSliceAlloc(T, arena, ".{}", null, .{}) catch null;
-    return std.zon.parse.fromSliceAlloc(T, arena, source, null, .{ .ignore_unknown_fields = true }) catch null;
+    var diag: std.zon.parse.Diagnostics = undefined;
+    if (source.len == 0) return std.zon.parse.fromSlice(T, .{ .gpa = arena, .arena = arena, .source = ".{}", .diagnostics = &diag }) catch null;
+    return std.zon.parse.fromSlice(T, .{ .gpa = arena, .arena = arena, .source = source, .diagnostics = &diag, .ignore_unknown_fields = true }) catch null;
 }
 
 fn eql(a: []const u8, b: []const u8) bool {
