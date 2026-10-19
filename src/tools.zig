@@ -1,23 +1,32 @@
-//! What each request does, on the UI thread. A tool either answers in the frame it is taken, or
+//! What each tool does, on the UI thread. A tool either answers in the frame it is taken, or
 //! waits — for a snapshot to be taken, a tape to play out, fizzy to settle, a measurement to run —
 //! and is answered from a later frame (`frame` checks what waits).
 //!
-//! Every tool's arguments and result are ZON. The bridge (`bridge/main.zig`) turns an MCP
-//! client's JSON into these arguments; the results go back as text, which reads as it is.
+//! The tools are the `agent.*` commands (`commands.zig`), so anything that calls a command reaches
+//! them: fizzy's control server (`/mcp`, `POST /commands/agent.run`), another plugin, and the
+//! socket `fizzy-mcp` speaks, whose requests are routed to the same commands (`handle`). Who is
+//! calling is the host's acting author (`Host.author`), not a connection: a call through the
+//! control server is its client's, one through the socket is that connection's (`connAuthor`).
+//! What an author works on is kept by the author's index into the host's authors (`who`), which
+//! the host keeps for its life.
 //!
-//! | tool | arguments | result |
-//! |---|---|---|
-//! | `hello` | `.{ .token, .client }` | the tools, what fizzy offers, and the executable it runs from |
-//! | `commands.list` | `.{ .prefix }` | no prefix: a line per command, its id and title (and "(not now)" when it cannot run); with one (`"pixi."`, or a whole id): those commands in full, parameters too (kind, description, default) |
-//! | `commands.call` | `.{ .id, .args = "<ZON>" }` | its result, or why not |
-//! | `ui.snapshot` | — | what is on screen (`automation` service): fizzy's windows, then each widget's role, name, tag, rect, parent and window |
-//! | `ui.capture` | `.{ .path, .window }` | a picture of a window (the main one, one by its tag, or `"*"` for all), as fizzy drew it, written raw to `path` (`"FZPX"`, width and height as little-endian `u32`, then premultiplied RGBA rows: the bridge scales and encodes it); on screen or not |
-//! | `ui.settled` | `.{ .timeout_ms }` | once nothing is in flight, or the time is up |
-//! | `ui.act` | `.{ .steps, .snapshot, .timeout_ms }` | input played as a person's, then (by default) the screen |
-//! | `tape.play` / `tape.outcome` | a live tape / `.{ .ticket }` | a ticket / how it ended |
-//! | `profile.report` | `.{ .ms }` | the profiler's report after `ms` of frames: per plugin, per scope |
-//! | `doc.claim` | `.{ .path, .label }` | a claim on an open document (`sdk.Claim`): the person's input to it waits until `doc.release`, the connection closes, or they press Stop. For work that cannot share the document; an agent's commands do not need one |
-//! | `doc.release` | `.{ .claim }`, `.{ .path }`, or neither for every session the connection has | `.{ .tapes }`: the sessions it recorded (`Recording`) |
+//! Every tool's arguments and result are ZON.
+//!
+//! | socket tool | command | arguments | result |
+//! |---|---|---|---|
+//! | `hello` | — | `.{ .token, .client }` | the tools, what fizzy offers, and the executable it runs from |
+//! | `commands.list` | — | `.{ .prefix }` | no prefix: a line per command, its id and title (and "(not now)" when it cannot run); with one (`"pixi."`, or a whole id): those commands in full, parameters too (kind, description, default) |
+//! | `ui.snapshot` | (`fizzy.screen`) | — | what is on screen (`automation` service): fizzy's windows, then each widget's role, name, tag, rect, parent and window |
+//! | `ui.settled` | (`fizzy.settled`) | `.{ .timeout_ms }` | once nothing is in flight, or the time is up |
+//! | `commands.call` | `agent.call` | `.{ .id, .args = "<ZON>" }` | its result, or why not |
+//! | `ui.capture` | `agent.capture` | `.{ .path, .window }` | a picture of a window (the main one, one by its tag, or `"*"` for all), as fizzy drew it, written raw to `path` (`"FZPX"`, width and height as little-endian `u32`, then premultiplied RGBA rows: the bridge scales and encodes it); on screen or not |
+//! | `ui.act` | `agent.act` | `.{ .steps, .snapshot, .timeout_ms }` | input played as a person's, then (by default) the screen |
+//! | `ui.run` | `agent.run` | `.{ .steps, .timeout_ms }` | a script across frames, one report |
+//! | `plugin.build` | `agent.build` | `.{ .path, .optimize, .check, .timeout_ms }` | build, reload, check |
+//! | `tape.play` / `tape.outcome` | `agent.tape` / `agent.tapeOutcome` | a live tape (the command: `.{ .tape }`) / `.{ .ticket }` | a ticket / how it ended |
+//! | `profile.report` | `agent.profile` | `.{ .ms, .drive, .startup }` | the profiler's report after `ms` of frames: per plugin, per scope |
+//! | `doc.claim` | `agent.claim` | `.{ .path, .label }` | a claim on an open document (`sdk.Claim`): the person's input to it waits until `agent.release`, the connection closes, or they press Stop. For work that cannot share the document; an agent's commands do not need one |
+//! | `doc.release` | `agent.release` | `.{ .claim }`, `.{ .path }`, or neither for every session the caller has | `.{ .tapes }`: the sessions it recorded (`Recording`) |
 const std = @import("std");
 const sdk = @import("fizzy_sdk");
 const dvui = @import("dvui");
@@ -30,11 +39,11 @@ const Recording = @import("Recording.zig");
 
 const Automation = sdk.services.automation.Api;
 
-/// Requests waiting on something, answered from a later frame. UI thread only.
+/// Calls waiting on something, answered from a later frame. UI thread only.
 var waiting: std.ArrayListUnmanaged(Waiting) = .empty;
 
 const Waiting = struct {
-    req: *Server.Request,
+    to: Reply,
     until: union(enum) {
         snapshot: Automation.SnapshotTicket,
         /// A picture, written to `path` (the host's allocation) once taken.
@@ -46,6 +55,69 @@ const Waiting = struct {
     },
 };
 
+/// Where a tool's answer goes, and whose call it was (`who`).
+pub const Reply = struct {
+    /// The caller, as an index into the host's authors.
+    who: u32,
+    to: union(enum) {
+        /// A socket request (`fizzy-mcp`'s), answered through the server.
+        req: *Server.Request,
+        /// An `agent.*` command's call, answered through `Host.finishCall`, before its `runWith`
+        /// returns or in a later frame.
+        ticket: u32,
+    },
+
+    /// Answer, with whatever the caller should hear besides (a claim the person stopped) after it
+    /// as a ZON comment, which leaves a ZON result readable.
+    pub fn send(self: Reply, host: *sdk.Host, ok: bool, text: []const u8) void {
+        const notice = if (self.outermost(host)) takeNotice(self.who) else null;
+        defer if (notice) |n| host.allocator.free(n);
+        switch (self.to) {
+            .req => |r| {
+                // The server is gone only once every request was answered (`deinit`).
+                const server = the_server orelse return;
+                if (notice) |n| r.notice = host.allocator.dupe(u8, n) catch null;
+                r.answer(server, ok, text);
+            },
+            .ticket => |t| {
+                const with = if (notice) |n| std.fmt.allocPrint(host.allocator, "{s}\n// {s}\n", .{ text, n }) catch null else null;
+                defer if (with) |w| host.allocator.free(w);
+                const out = with orelse text;
+                host.finishCall(t, if (ok) .{ .ok = out } else .{ .failed = out });
+            },
+        }
+    }
+
+    /// Whether this answer goes straight to whoever called from outside, so a notice may ride
+    /// on it: a socket request, the call running now when no agent's call is around it, or a
+    /// later answer someone waits for. Not an answer that becomes part of another (a script's
+    /// `call` step, `agent.call` reaching an `agent.*` command), whose ZON a comment would break
+    /// and whose reader is not the agent; the notice waits for an answer that is.
+    fn outermost(self: Reply, host: *sdk.Host) bool {
+        return switch (self.to) {
+            .req => true,
+            .ticket => |t| embedding == 0 and (host.callWanted(t) or
+                if (host.running_call) |c| c.ticket == t else false),
+        };
+    }
+};
+
+/// How many of the agent's own calls are running around now (`agentCallAwaiting`): an answer
+/// given inside one is part of another answer (`Reply.outermost`).
+var embedding: u32 = 0;
+
+/// Socket requests whose command answers later, by its ticket: answered at `deinit` if it has
+/// not, since a request's thread waits until it is, and `Server.stop` waits for the thread. UI
+/// thread only.
+var socket_calls: std.ArrayListUnmanaged(struct { req: *Server.Request, ticket: u32 }) = .empty;
+/// `agent.call`s whose command answers later (`LaterCall`), answered at `deinit` if not yet.
+var later_calls: std.ArrayListUnmanaged(*LaterCall) = .empty;
+
+/// What makes this load's socket authors its own: a connection's number starts again at each
+/// load, and the host keeps its authors across loads, so a new connection 1 must not be the last
+/// load's connection 1 (its steps merged into theirs, its name over theirs).
+var load_nonce: u32 = 0;
+
 fn now() i96 {
     return std.Io.Clock.boot.now(dvui.io).nanoseconds;
 }
@@ -54,66 +126,120 @@ fn ms(n: u32) i96 {
     return @as(i96, n) * std.time.ns_per_ms;
 }
 
-/// The agent plugin itself, which claims documents (`doc.claim`). Set by `plugin.zig`.
+/// The agent plugin itself, which claims documents (`agent.claim`) and owns its commands. Set by
+/// `plugin.zig`.
 pub var owner: ?*sdk.Plugin = null;
+/// The host, set by `plugin.zig`: authors are read through it (`authorOf`).
+pub var the_host: ?*sdk.Host = null;
+/// The socket's server while it serves (desktop): where a socket request's answer goes.
+pub var the_server: ?*Server = null;
 
-/// A connection's work on a document, from its first command on it: recorded as it goes, and
-/// written as a tape when it ends (`doc.release`, the connection closing, the document closing).
+/// An author's work on a document, from their first command on it: recorded as it goes, and
+/// written as a tape when it ends (`agent.release`, the connection closing, the document closing).
 /// It takes nothing from the person: they keep working in the document, and the plugins that own
 /// it keep the two from colliding (pixi waits out a stroke of theirs). A `claim` only when the
-/// agent asked to hold the document (`doc.claim`). UI thread only.
+/// agent asked to hold the document (`agent.claim`). UI thread only.
 var held: std.ArrayListUnmanaged(Held) = .empty;
 const Held = struct {
-    conn: u32,
+    /// Whose: an index into the host's authors.
+    who: u32,
     path: []u8,
     claim: ?u32 = null,
     /// The session on it so far, written as a tape when it ends.
     rec: ?Recording = null,
 };
 
-/// What each connection is called, from its client's name in `hello` ("Claude"): what the
+/// What each socket connection is called, from its client's name in `hello` ("Claude"): what the
 /// person reads beside its steps (`sdk.Author.label`). A connection with no name is "An agent".
 var labels: std.AutoHashMapUnmanaged(u32, []u8) = .empty;
 
-/// Connection `conn`, as the author of what it does.
-pub fn author(conn: u32) sdk.Author {
-    return .{ .kind = .agent, .plugin = "agent", .session = conn, .label = labels.get(conn) orelse "An agent" };
+/// The author `who` names (an index into the host's authors, as `who` always is here).
+pub fn authorOf(who: u32) sdk.Author {
+    return the_host.?.authors.items[who];
 }
 
-/// What a connection should hear with its next answer: a claim the person stopped.
-var notices: std.ArrayListUnmanaged(struct { conn: u32, text: []u8 }) = .empty;
+/// `author`'s index into the host's authors, which the host makes when it is new.
+fn indexOf(host: *sdk.Host, a: sdk.Author) u32 {
+    const outer = host.act(a);
+    defer host.endAct(outer);
+    return host.acted().author.?;
+}
 
-/// Take what arrived and answer what can be. Once a frame, from `beginFrame`.
-pub fn frame(host: *sdk.Host, server: *Server) void {
-    var batch: std.ArrayListUnmanaged(*Server.Request) = .empty;
-    defer batch.deinit(host.allocator);
-    var closed: std.ArrayListUnmanaged(u32) = .empty;
-    defer closed.deinit(host.allocator);
-    server.take(&batch, &closed);
-    tendClaims(host, server, closed.items);
-    for (closed.items) |c| if (labels.fetchRemove(c)) |kv| host.allocator.free(kv.value);
-    for (batch.items) |req| {
-        attachNotice(server, req);
-        handle(host, server, req);
-    }
+/// Socket connection `conn`, as an author.
+fn connAuthor(host: *sdk.Host, conn: u32) u32 {
+    if (load_nonce == 0) dvui.io.random(std.mem.asBytes(&load_nonce));
+    load_nonce |= 1;
+    const id = @as(u64, load_nonce) << 32 | conn;
+    return indexOf(host, .{ .kind = .agent, .plugin = "agent", .session = id, .label = labels.get(conn) orelse "An agent" });
+}
+
+/// Who is calling a command now: the acting author when it is an agent (the control server's
+/// client, the socket's connection), else one agent standing for every caller that does not say
+/// (a `curl` call, a plugin's), so its steps still read as an agent's and not the person's.
+pub fn caller(host: *sdk.Host) u32 {
+    if (host.author().kind == .agent) return host.acted().author.?;
+    // Session 0: no socket connection is numbered 0 (`Server.next_conn` starts at 1).
+    return indexOf(host, .{ .kind = .agent, .plugin = "agent", .session = 0, .label = "An agent" });
+}
+
+/// What an author should hear with their next answer: a claim the person stopped. Texts in the
+/// host's allocator.
+var notices: std.ArrayListUnmanaged(struct { who: u32, text: []u8 }) = .empty;
+
+fn takeNotice(who: u32) ?[]u8 {
+    for (notices.items, 0..) |n, i| if (n.who == who) {
+        _ = notices.swapRemove(i);
+        return n.text;
+    };
+    return null;
+}
+
+/// Take what arrived on the socket and answer what can be, then what waits. Once a frame, from
+/// `beginFrame`.
+pub fn frame(host: *sdk.Host) void {
+    if (the_server) |server| {
+        var batch: std.ArrayListUnmanaged(*Server.Request) = .empty;
+        defer batch.deinit(host.allocator);
+        var closed: std.ArrayListUnmanaged(u32) = .empty;
+        defer closed.deinit(host.allocator);
+        server.take(&batch, &closed);
+        var closed_authors: std.ArrayListUnmanaged(u32) = .empty;
+        defer closed_authors.deinit(host.allocator);
+        for (closed.items) |c| closed_authors.append(host.allocator, connAuthor(host, c)) catch {};
+        tendClaims(host, closed_authors.items);
+        // Nobody is left to hear a closed connection's notices: its answers are done.
+        for (closed_authors.items) |who| while (takeNotice(who)) |n| host.allocator.free(n);
+        for (closed.items) |c| if (labels.fetchRemove(c)) |kv| host.allocator.free(kv.value);
+        for (batch.items) |req| handle(host, req);
+    } else tendClaims(host, &.{});
 
     var i: usize = 0;
     while (i < waiting.items.len) {
-        if (check(host, server, &waiting.items[i])) {
+        if (check(host, &waiting.items[i])) {
             _ = waiting.swapRemove(i);
         } else i += 1;
     }
 }
 
-/// Answer whatever still waits: fizzy is going.
-pub fn deinit(host: *sdk.Host, server: *Server) void {
-    for (waiting.items) |w| {
-        switch (w.until) {
-            .run => |r| r.deinit(host.allocator),
-            .build => |b| b.deinit(),
-            else => {},
-        }
-        w.req.answer(server, false, "fizzy is closing");
+/// Answer whatever still waits: fizzy is going, or the plugin is.
+pub fn deinit(host: *sdk.Host) void {
+    // Calls waiting on other commands first: answering an `agent.call` may answer the socket
+    // request waiting on it. The host may have let go of their sinks already (a plugin being
+    // retired loses its waits before its `deinit`), so each is answered here, not through it.
+    for (later_calls.items) |c| {
+        host.abandonCall(c.inner);
+        c.to.send(host, false, "fizzy is closing");
+        c.free(host.allocator);
+    }
+    later_calls.deinit(host.allocator);
+    for (socket_calls.items) |c| {
+        host.abandonCall(c.ticket);
+        if (the_server) |server| c.req.answer(server, false, "fizzy is closing");
+    }
+    socket_calls.deinit(host.allocator);
+    for (waiting.items) |*w| {
+        drop(host, w);
+        w.to.send(host, false, "fizzy is closing");
     }
     waiting.deinit(host.allocator);
     for (held.items) |*h| {
@@ -122,21 +248,23 @@ pub fn deinit(host: *sdk.Host, server: *Server) void {
         host.allocator.free(h.path);
     }
     held.deinit(host.allocator);
-    for (notices.items) |n| server.gpa.free(n.text);
+    for (notices.items) |n| host.allocator.free(n.text);
     notices.deinit(host.allocator);
     var it = labels.valueIterator();
     while (it.next()) |l| host.allocator.free(l.*);
     labels.deinit(host.allocator);
 }
 
-/// End the sessions of closed connections and on closed documents, and turn claims the person
-/// stopped into a notice for the connection that made them. Nothing here waits on a clock: a
-/// session ends when something happens.
-fn tendClaims(host: *sdk.Host, server: *Server, closed: []const u32) void {
+/// End the sessions of authors gone (`closed`: socket connections that closed) and on closed
+/// documents, and turn claims the person stopped into a notice for the author that made them.
+/// Nothing here waits on a clock: a session ends when something happens. A caller through the
+/// control server ends its sessions with `agent.release`, or they end with the document; the
+/// seam for ending them with its MCP session is an event the control server would emit then.
+fn tendClaims(host: *sdk.Host, closed: []const u32) void {
     var i: usize = 0;
     while (i < held.items.len) {
         const h = &held.items[i];
-        const gone = std.mem.indexOfScalar(u32, closed, h.conn) != null or host.docFromPath(h.path) == null;
+        const gone = std.mem.indexOfScalar(u32, closed, h.who) != null or host.docFromPath(h.path) == null;
         if (gone) {
             if (h.claim) |c| host.releaseClaim(c);
             if (finish(host, h)) |tape| {
@@ -146,8 +274,8 @@ fn tendClaims(host: *sdk.Host, server: *Server, closed: []const u32) void {
         } else if (h.claim != null and !host.claimHolds(h.claim.?)) {
             const tape = finish(host, h);
             defer if (tape) |t| host.allocator.free(t);
-            const text = std.fmt.allocPrint(server.gpa, "the person pressed Stop on {s}: leave it be, and ask before claiming it again.{s}{s}", .{ h.path, if (tape != null) " The session so far is a tape: " else "", tape orelse "" }) catch null;
-            if (text) |t| notices.append(host.allocator, .{ .conn = h.conn, .text = t }) catch server.gpa.free(t);
+            const text = std.fmt.allocPrint(host.allocator, "the person pressed Stop on {s}: leave it be, and ask before claiming it again.{s}{s}", .{ h.path, if (tape != null) " The session so far is a tape: " else "", tape orelse "" }) catch null;
+            if (text) |t| notices.append(host.allocator, .{ .who = h.who, .text = t }) catch host.allocator.free(t);
         } else {
             i += 1;
             continue;
@@ -157,57 +285,95 @@ fn tendClaims(host: *sdk.Host, server: *Server, closed: []const u32) void {
     }
 }
 
-fn attachNotice(server: *Server, req: *Server.Request) void {
-    for (notices.items, 0..) |n, i| {
-        if (n.conn != req.conn) continue;
-        if (req.notice) |old| server.gpa.free(old);
-        req.notice = n.text;
-        _ = notices.swapRemove(i);
-        return;
-    }
-}
-
-fn claim(host: *sdk.Host, server: *Server, req: *Server.Request, arena: std.mem.Allocator, source: [:0]const u8) void {
-    const a = parse(struct { path: []const u8, label: []const u8 = "An agent" }, arena, source) orelse
-        return req.answer(server, false, "doc.claim takes .{ .path, .label }");
-    const doc = host.docFromPath(a.path) orelse return req.answer(server, false, "that document is not open: open it first (fizzy.openFiles)");
-    const me = owner orelse return req.answer(server, false, "the agent plugin is not registered");
-    const h = session(host, req.conn, doc, a.label) catch return req.answer(server, false, "out of memory");
-    const id = h.claim orelse host.claimDocument(me, doc.id, a.label) catch |err| return req.answer(server, false, switch (err) {
+/// `agent.claim`: hold the open document `path`, the person reading `label` meanwhile.
+pub fn claim(host: *sdk.Host, to: Reply, path: []const u8, label: []const u8) void {
+    var buf: [32]u8 = undefined;
+    const doc = host.docFromPath(path) orelse return to.send(host, false, "that document is not open: open it first (fizzy.openFiles)");
+    const me = owner orelse return to.send(host, false, "the agent plugin is not registered");
+    const h = session(host, to.who, doc, label) catch return to.send(host, false, "out of memory");
+    const id = h.claim orelse host.claimDocument(me, doc.id, label) catch |err| return to.send(host, false, switch (err) {
         error.DocumentClaimed => "someone else is holding that document",
         else => "out of memory",
     });
     h.claim = id;
-    req.answer(server, true, std.fmt.allocPrint(arena, ".{{ .claim = {d} }}", .{id}) catch "?");
+    to.send(host, true, std.fmt.bufPrint(&buf, ".{{ .claim = {d} }}", .{id}) catch "?");
 }
 
-/// Run command `id` as connection `conn`'s step, as `commands.call` and a run's `call` steps both
-/// do: the session on the document it works on begins before it runs (shown beside the person,
-/// its tape starting from the document as it was), and the step goes into that session's tape,
-/// not into every one the connection has.
-pub fn agentCall(host: *sdk.Host, conn: u32, id: []const u8, args: []const u8, arena: std.mem.Allocator) sdk.Host.CommandOutcome {
-    if (undoesAnother(host, conn, id)) |active| return .{ .failed = std.fmt.allocPrint(
+/// Run command `id` as `who`'s step, as `agent.call` and a run's `call` steps both do: the session
+/// on the document it works on begins before it runs (shown beside the person, its tape starting
+/// from the document as it was), and the step goes into that session's tape, not into every one
+/// the author has.
+pub fn agentCall(host: *sdk.Host, who: u32, id: []const u8, args: []const u8, arena: std.mem.Allocator) sdk.Host.CommandOutcome {
+    return switch (agentCallAwaiting(host, who, id, args, arena, null)) {
+        .now => |o| o,
+        // Nobody waits for it here (a script's step): started, as a menu would start it.
+        .later => .{ .ok = null },
+    };
+}
+
+/// `agentCall`, and `sink` hears a command that answers in a later frame (`agent.call` waiting on
+/// `fizzy.settled`, say). A step answered later is noted in its session's tape when it is answered.
+fn agentCallAwaiting(host: *sdk.Host, who: u32, id: []const u8, args: []const u8, arena: std.mem.Allocator, sink: ?sdk.Host.CallSink) sdk.Host.AwaitedOutcome {
+    if (undoesAnother(host, who, id)) |active| return .{ .now = .{ .failed = std.fmt.allocPrint(
         arena,
         "{s} acts on the active document, {s}, which is not one you are working on: it would take back the person's steps. Take back your own by clearing what you drew and drawing it again.",
         .{ id, active },
-    ) catch "undo acts on the active document, which is not yours" };
+    ) catch "undo acts on the active document, which is not yours" } };
     const doc_path: ?[]const u8 = if (target(host, id, arena.dupeSentinel(u8, args, 0) catch "", arena)) |doc| blk: {
-        const h = session(host, conn, doc, author(conn).label) catch break :blk null;
+        const h = session(host, who, doc, authorOf(who).label) catch break :blk null;
         break :blk arena.dupe(u8, h.path) catch null;
     } else null;
     // What the command opens or creates lands beside the person, not over their document, and
-    // the steps it records are this connection's.
+    // the steps it records are this author's.
     host.openBeside();
-    const outer = host.act(author(conn));
-    const out = host.callCommand(id, args, arena);
+    const outer = host.act(authorOf(who));
+    embedding += 1;
+    const out = host.callCommandAwaiting(id, args, arena, sink);
+    embedding -= 1;
     host.endAct(outer);
     host.endOpenBeside();
-    if (out == .ok) if (doc_path) |p| for (held.items) |*h| {
-        if (h.conn != conn or !eql(h.path, p)) continue;
-        if (h.rec) |*rec| rec.note(id, args, host.last_showing_ms) catch {};
-    };
+    if (out == .now and out.now == .ok) if (doc_path) |p| note(host, who, p, id, args);
     return out;
 }
+
+/// Note step `id` in `who`'s session on `path`, for its tape.
+fn note(host: *sdk.Host, who: u32, path: []const u8, id: []const u8, args: []const u8) void {
+    for (held.items) |*h| {
+        if (h.who != who or !eql(h.path, path)) continue;
+        if (h.rec) |*rec| rec.note(id, args, host.last_showing_ms) catch {};
+    }
+}
+
+/// An `agent.call` whose command answers later: who to answer, and the step to note then. Owns
+/// its strings, in the host's allocator. Let go of with the plugin's sinks if the plugin goes
+/// first, which leaks it once, at unload.
+const LaterCall = struct {
+    to: Reply,
+    id: []u8,
+    args: []u8,
+    path: ?[]u8,
+    /// The command's own ticket, which this waits on.
+    inner: u32 = 0,
+
+    fn done(ctx: *anyopaque, outcome: sdk.Host.CommandOutcome) void {
+        const self: *LaterCall = @ptrCast(@alignCast(ctx));
+        const host = the_host orelse return;
+        for (later_calls.items, 0..) |c, i| if (c == self) {
+            _ = later_calls.swapRemove(i);
+            break;
+        };
+        if (outcome == .ok) if (self.path) |p| note(host, self.to.who, p, self.id, self.args);
+        answerOutcome(host, self.to, outcome);
+        self.free(host.allocator);
+    }
+
+    fn free(self: *LaterCall, gpa: std.mem.Allocator) void {
+        gpa.free(self.id);
+        gpa.free(self.args);
+        if (self.path) |p| gpa.free(p);
+        gpa.destroy(self);
+    }
+};
 
 /// What the person reads for an MCP client's name: "Claude" for Claude's clients
 /// ("claude-code", "claude-ai"), else the name as given.
@@ -216,24 +382,24 @@ fn clientLabel(client: []const u8) []const u8 {
 }
 
 /// Undo and redo (`fizzy.undo`, `pixi.redo`, ...) take no document: they act on the active one.
-/// When that is not one connection `conn` works on, it is the person's, and an agent's undo would
+/// When that is not one `who` works on, it is the person's, and an agent's undo would
 /// take back their steps: answers its path, to refuse with. Until undo takes a `path`
 /// (`plans/SHARED_HISTORY_PLAN.md`, step 5), an agent undoes only its own document, and only
 /// while it is the active one.
-fn undoesAnother(host: *sdk.Host, conn: u32, id: []const u8) ?[]const u8 {
+fn undoesAnother(host: *sdk.Host, who: u32, id: []const u8) ?[]const u8 {
     const action = id[if (std.mem.lastIndexOfScalar(u8, id, '.')) |dot| dot + 1 else 0..];
     if (!eql(action, "undo") and !eql(action, "redo")) return null;
     const doc = host.activeDoc() orelse return null;
     const path = doc.owner.documentPath(doc);
-    for (held.items) |h| if (h.conn == conn and eql(h.path, path)) return null;
+    for (held.items) |h| if (h.who == who and eql(h.path, path)) return null;
     return path;
 }
 
-/// Connection `conn`'s session on `doc`: the one it has, or a new one, recorded from now on and
+/// `who`'s session on `doc`: the one it has, or a new one, recorded from now on and
 /// shown beside the person (`OpenOptions.beside`), who keeps the pane they are in.
-fn session(host: *sdk.Host, conn: u32, doc: sdk.DocHandle, label: []const u8) !*Held {
+fn session(host: *sdk.Host, who: u32, doc: sdk.DocHandle, label: []const u8) !*Held {
     const doc_path = doc.owner.documentPath(doc);
-    for (held.items) |*h| if (h.conn == conn and eql(h.path, doc_path)) return h;
+    for (held.items) |*h| if (h.who == who and eql(h.path, doc_path)) return h;
     const path = try host.allocator.dupe(u8, doc_path);
     errdefer host.allocator.free(path);
     const unix_s: i64 = @intCast(@divTrunc(std.Io.Clock.real.now(dvui.io).nanoseconds, std.time.ns_per_s));
@@ -241,7 +407,7 @@ fn session(host: *sdk.Host, conn: u32, doc: sdk.DocHandle, label: []const u8) !*
         std.log.info("agent: {s} is worked on but not recorded: {t}", .{ path, err });
         break :blk null;
     };
-    try held.append(host.allocator, .{ .conn = conn, .path = path, .rec = rec });
+    try held.append(host.allocator, .{ .who = who, .path = path, .rec = rec });
     _ = host.openFile(.{ .path = path, .beside = true }) catch {};
     return &held.items[held.items.len - 1];
 }
@@ -256,21 +422,21 @@ fn target(host: *sdk.Host, id: []const u8, args: [:0]const u8, arena: std.mem.Al
     return if (eql(doc.owner.id, id[0..dot])) doc else null;
 }
 
-fn release(host: *sdk.Host, server: *Server, req: *Server.Request, arena: std.mem.Allocator, source: [:0]const u8) void {
-    const a = parse(struct { claim: u32 = 0, path: []const u8 = "" }, arena, source) orelse
-        return req.answer(server, false, "doc.release takes .{ .claim }, .{ .path }, or neither for every document this connection holds");
+/// `agent.release`: let go of claim `claim_id`, or end the caller's session on `path`, or with
+/// neither every one of the caller's.
+pub fn release(host: *sdk.Host, to: Reply, arena: std.mem.Allocator, claim_id: u32, path: []const u8) void {
     var tapes: std.ArrayListUnmanaged([]const u8) = .empty;
     var i: usize = 0;
     while (i < held.items.len) {
         const h = &held.items[i];
-        const this = if (a.claim != 0) h.claim == a.claim else h.conn == req.conn and (a.path.len == 0 or eql(h.path, a.path));
+        const this = h.who == to.who and if (claim_id != 0) h.claim == claim_id else path.len == 0 or eql(h.path, path);
         if (!this) {
             i += 1;
             continue;
         }
         if (h.claim) |c| host.releaseClaim(c);
         if (finish(host, h)) |t| {
-            tapes.append(arena, arena.dupe(u8, t) catch t) catch {};
+            if (arena.dupe(u8, t)) |copy| tapes.append(arena, copy) catch {} else |_| {}
             host.allocator.free(t);
         }
         host.allocator.free(h.path);
@@ -278,7 +444,7 @@ fn release(host: *sdk.Host, server: *Server, req: *Server.Request, arena: std.me
     }
     var w: std.Io.Writer.Allocating = .init(arena);
     std.zon.stringify.serialize(.{ .tapes = tapes.items }, .{ .whitespace = false }, &w.writer) catch {};
-    req.answer(server, true, w.written());
+    to.send(host, true, w.written());
 }
 
 /// Write a held document's session as a tape, if anything was recorded, into `<config>/tapes/`;
@@ -302,20 +468,29 @@ fn automation(host: *sdk.Host) ?*Automation {
     return host.getServiceTyped(Automation);
 }
 
-fn handle(host: *sdk.Host, server: *Server, req: *Server.Request) void {
+/// One socket request: `hello` and `commands.list` are the socket's own, a snapshot and settling
+/// are answered here as the bridge reads them, and every other tool is its `agent.*` command,
+/// called as this connection (`connAuthor`) through `Host.callCommandAwaiting`, as the control
+/// server calls it.
+fn handle(host: *sdk.Host, req: *Server.Request) void {
     var arena_state: std.heap.ArenaAllocator = .init(host.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    const source = arena.dupeSentinel(u8, req.args, 0) catch return req.answer(server, false, "out of memory");
     const tool = req.tool;
 
     if (eql(tool, "hello")) {
+        const source = arena.dupeSentinel(u8, req.args, 0) catch return req.answer(the_server.?, false, "out of memory");
         // The client's name, as its MCP client gave it ("claude-code"): the label its steps carry.
         if (parse(struct { client: []const u8 = "" }, arena, source)) |a| if (a.client.len > 0) {
             if (host.allocator.dupe(u8, clientLabel(a.client))) |l| {
                 if (labels.fetchPut(host.allocator, req.conn, l) catch null) |old| host.allocator.free(old.value);
             } else |_| {}
         };
+    }
+    const to: Reply = .{ .who = connAuthor(host, req.conn), .to = .{ .req = req } };
+    const source = arena.dupeSentinel(u8, req.args, 0) catch return to.send(host, false, "out of memory");
+
+    if (eql(tool, "hello")) {
         // The executable this fizzy runs from: the bridge compares it across an app build to tell
         // whether fizzy will restart into a new one (`fizzy_build` on an app's repo).
         var buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -325,84 +500,154 @@ fn handle(host: *sdk.Host, server: *Server, req: *Server.Request) void {
             .app = "fizzy",
             .executable = buf[0..n],
             .tools = .{ "commands.list", "commands.call", "ui.snapshot", "ui.capture", "ui.settled", "ui.act", "ui.run", "plugin.build", "tape.play", "tape.outcome", "profile.report", "doc.claim", "doc.release" },
-        }, .{ .whitespace = false }, &w.writer) catch return req.answer(server, false, "out of memory");
-        return req.answer(server, true, w.written());
+        }, .{ .whitespace = false }, &w.writer) catch return to.send(host, false, "out of memory");
+        return to.send(host, true, w.written());
     }
     if (eql(tool, "commands.list")) {
         const a = parse(struct { prefix: []const u8 = "" }, arena, source) orelse
-            return req.answer(server, false, "commands.list takes .{ .prefix = \"<a plugin's id and a dot, or a command's id>\" }");
-        return listCommands(host, server, req, arena, a.prefix);
+            return to.send(host, false, "commands.list takes .{ .prefix = \"<a plugin's id and a dot, or a command's id>\" }");
+        return listCommands(host, to, arena, a.prefix);
     }
-    if (eql(tool, "doc.claim")) return claim(host, server, req, arena, source);
-    if (eql(tool, "doc.release")) return release(host, server, req, arena, source);
-    if (eql(tool, "commands.call")) {
-        const a = parse(struct { id: []const u8, args: []const u8 = "" }, arena, source) orelse
-            return req.answer(server, false, "commands.call takes .{ .id, .args = \"<ZON>\" }");
-        return switch (agentCall(host, req.conn, a.id, a.args, arena)) {
-            .ok => |r| req.answer(server, true, r orelse "null"),
-            .unknown => req.answer(server, false, "no command by that id (commands.list)"),
-            .disabled => req.answer(server, false, "that command is not enabled now"),
-            .bad_args => |m| req.answer(server, false, m),
-            .failed => |m| req.answer(server, false, m),
-        };
-    }
-    const auto = automation(host) orelse return req.answer(server, false, "this app offers no automation service");
     if (eql(tool, "ui.snapshot")) {
-        return wait(host, server, req, .{ .snapshot = auto.snapshot() });
-    }
-    if (eql(tool, "ui.capture")) {
-        const a = parse(struct { path: []const u8, window: []const u8 = "" }, arena, source) orelse
-            return req.answer(server, false, "ui.capture takes .{ .path = \"<absolute path of the raw picture to write>\", .window = \"<a window's tag, or \\\"*\\\" for all; none for the main window>\" }");
-        if (!std.fs.path.isAbsolute(a.path)) return req.answer(server, false, "give the picture's path as an absolute path");
-        const path = host.allocator.dupe(u8, a.path) catch return req.answer(server, false, "out of memory");
-        return wait(host, server, req, .{ .capture = .{ .ticket = auto.capture(a.window), .path = path } });
+        const auto = automation(host) orelse return to.send(host, false, "this app offers no automation service");
+        return wait(host, to, .{ .snapshot = auto.snapshot() });
     }
     if (eql(tool, "ui.settled")) {
+        const auto = automation(host) orelse return to.send(host, false, "this app offers no automation service");
         const Args = struct { timeout_ms: u32 = 5000 };
         const a = parse(Args, arena, source) orelse Args{};
-        if (auto.settled()) return req.answer(server, true, "true");
-        return wait(host, server, req, .{ .settled = now() + ms(a.timeout_ms) });
+        if (auto.settled()) return to.send(host, true, "true");
+        return wait(host, to, .{ .settled = now() + ms(a.timeout_ms) });
     }
-    if (eql(tool, "ui.act")) return act(host, server, req, arena, source);
-    if (eql(tool, "ui.run")) return run(host, server, req, auto, source);
-    if (eql(tool, "plugin.build")) {
-        const plugins = host.getServiceTyped(sdk.services.plugins.Api) orelse return req.answer(server, false, "this app offers no plugins service (fizzy's SDK 0.2.22 or later)");
-        const b = Build.start(host.allocator, host, plugins, req.conn, source) catch |err| return req.answer(server, false, switch (err) {
-            error.BadArguments => "plugin.build takes .{ .path = \"<plugin directory>\", .optimize, .check = .{ <ui.run steps> }, .timeout_ms }",
-            error.PathNotAbsolute => "give the plugin's directory as an absolute path",
-            error.NoPluginZon => "no plugin.zig.zon with an id in that directory",
-            error.CannotBuildItself => "the agent plugin cannot rebuild itself: its reload would end this request",
-            else => @errorName(err),
-        });
-        return wait(host, server, req, .{ .build = b });
+
+    const routes = [_][2][]const u8{
+        .{ "commands.call", "agent.call" },
+        .{ "ui.capture", "agent.capture" },
+        .{ "ui.act", "agent.act" },
+        .{ "ui.run", "agent.run" },
+        .{ "plugin.build", "agent.build" },
+        .{ "tape.play", "agent.tape" },
+        .{ "tape.outcome", "agent.tapeOutcome" },
+        .{ "profile.report", "agent.profile" },
+        .{ "doc.claim", "agent.claim" },
+        .{ "doc.release", "agent.release" },
+    };
+    const id = for (routes) |r| {
+        if (eql(r[0], tool)) break r[1];
+    } else return to.send(host, false, "no such tool (hello lists them)");
+    // `tape.play` sends the tape itself; its command takes it as `.tape`.
+    const args = if (eql(tool, "tape.play"))
+        std.fmt.allocPrint(arena, ".{{ .tape = \"{f}\" }}", .{std.zig.fmtString(req.args)}) catch return to.send(host, false, "out of memory")
+    else
+        req.args;
+    const outer = host.act(authorOf(to.who));
+    const out = host.callCommandAwaiting(id, args, arena, .{ .ctx = req, .done = answerRequest, .owner = owner });
+    host.endAct(outer);
+    switch (out) {
+        .now => |o| answerOutcome(host, to, o),
+        .later => |t| socket_calls.append(host.allocator, .{ .req = req, .ticket = t }) catch {
+            host.abandonCall(t);
+            to.send(host, false, "out of memory");
+        },
     }
-    if (eql(tool, "tape.play")) {
-        return switch (auto.playAs(req.args, author(req.conn))) {
-            .started => |t| req.answer(server, true, std.fmt.allocPrint(arena, ".{{ .ticket = {d} }}", .{@backingInt(t)}) catch "?"),
-            .busy => req.answer(server, false, "something else is driving fizzy: a tape or a demo"),
-            .invalid => |why| req.answer(server, false, why),
-        };
-    }
-    if (eql(tool, "tape.outcome")) {
-        const a = parse(struct { ticket: u32 }, arena, source) orelse return req.answer(server, false, "tape.outcome takes .{ .ticket }");
-        var buf: [64]u8 = undefined;
-        return req.answer(server, true, outcomeText(&buf, auto.outcome(@fromBackingInt(@intCast(a.ticket)))));
-    }
-    if (eql(tool, "profile.report")) {
-        // `drive`: ask for every frame, to measure what drawing costs; else only the frames fizzy
-        // draws on its own are measured (`measure.zig`).
-        // `startup`: also when the app's start reached each phase (`core.profile.Phases`).
-        const Args = struct { ms: u32 = 1000, drive: bool = false, startup: bool = false };
-        const a = parse(Args, arena, source) orelse Args{};
-        // A window of averages is half a second: ask for a little more than was asked.
-        core.profile.want(a.ms + 600);
-        return wait(host, server, req, .{ .profile = .{ .until = now() + ms(a.ms + 600), .drive = a.drive, .startup = a.startup } });
-    }
-    req.answer(server, false, "no such tool (hello lists them)");
 }
 
-fn wait(host: *sdk.Host, server: *Server, req: *Server.Request, until: @FieldType(Waiting, "until")) void {
-    waiting.append(host.allocator, .{ .req = req, .until = until }) catch req.answer(server, false, "out of memory");
+/// A socket request's command answering in a later frame (`CallSink.done`).
+fn answerRequest(ctx: *anyopaque, outcome: sdk.Host.CommandOutcome) void {
+    const req: *Server.Request = @ptrCast(@alignCast(ctx));
+    const host = the_host orelse return;
+    for (socket_calls.items, 0..) |c, i| if (c.req == req) {
+        _ = socket_calls.swapRemove(i);
+        break;
+    };
+    answerOutcome(host, .{ .who = connAuthor(host, req.conn), .to = .{ .req = req } }, outcome);
+}
+
+fn answerOutcome(host: *sdk.Host, to: Reply, outcome: sdk.Host.CommandOutcome) void {
+    switch (outcome) {
+        .ok => |r| to.send(host, true, r orelse "null"),
+        .unknown => to.send(host, false, "no command by that id (commands.list)"),
+        .disabled => to.send(host, false, "that command is not enabled now"),
+        .bad_args, .failed => |m| to.send(host, false, m),
+    }
+}
+
+/// `agent.call`: command `id` with `args`, as the caller's step.
+pub fn call(host: *sdk.Host, to: Reply, arena: std.mem.Allocator, id: []const u8, args: []const u8) void {
+    const gpa = host.allocator;
+    const pending = gpa.create(LaterCall) catch return to.send(host, false, "out of memory");
+    pending.* = .{ .to = to, .id = gpa.dupe(u8, id) catch "", .args = gpa.dupe(u8, args) catch "", .path = null };
+    // The document it works on, for the note when it answers later: the session `agentCallAwaiting`
+    // finds or makes for it.
+    if (target(host, id, arena.dupeSentinel(u8, args, 0) catch "", arena)) |doc| pending.path = gpa.dupe(u8, doc.owner.documentPath(doc)) catch null;
+    switch (agentCallAwaiting(host, to.who, id, args, arena, .{ .ctx = pending, .done = LaterCall.done, .owner = owner })) {
+        .now => |o| {
+            pending.free(gpa);
+            answerOutcome(host, to, o);
+        },
+        .later => |t| {
+            pending.inner = t;
+            later_calls.append(gpa, pending) catch {
+                host.abandonCall(t);
+                pending.free(gpa);
+                to.send(host, false, "out of memory");
+            };
+        },
+    }
+}
+
+/// `agent.capture`: a picture of a window, written raw to `path`.
+pub fn capture(host: *sdk.Host, to: Reply, path: []const u8, window: []const u8) void {
+    const auto = automation(host) orelse return to.send(host, false, "this app offers no automation service");
+    if (!std.fs.path.isAbsolute(path)) return to.send(host, false, "give the picture's path as an absolute path");
+    const owned = host.allocator.dupe(u8, path) catch return to.send(host, false, "out of memory");
+    waiting.append(host.allocator, .{ .to = to, .until = .{ .capture = .{ .ticket = auto.capture(window), .path = owned } } }) catch {
+        host.allocator.free(owned);
+        to.send(host, false, "out of memory");
+    };
+}
+
+/// `agent.build`: build a plugin, wait for it to reload, run its check (`Build.zig`).
+pub fn build(host: *sdk.Host, to: Reply, source: [:0]const u8) void {
+    const plugins = host.getServiceTyped(sdk.services.plugins.Api) orelse return to.send(host, false, "this app offers no plugins service (fizzy's SDK 0.2.22 or later)");
+    const b = Build.start(host.allocator, host, plugins, to.who, source) catch |err| return to.send(host, false, switch (err) {
+        error.BadArguments => "agent.build takes .{ .path = \"<plugin directory>\", .optimize, .check = .{ <agent.run steps> }, .timeout_ms }",
+        error.PathNotAbsolute => "give the plugin's directory as an absolute path",
+        error.NoPluginZon => "no plugin.zig.zon with an id in that directory",
+        error.CannotBuildItself => "the agent plugin cannot rebuild itself: its reload would end this request",
+        else => @errorName(err),
+    });
+    wait(host, to, .{ .build = b });
+}
+
+/// `agent.tape`: play a live tape as the caller.
+pub fn playTape(host: *sdk.Host, to: Reply, arena: std.mem.Allocator, bytes: []const u8) void {
+    const auto = automation(host) orelse return to.send(host, false, "this app offers no automation service");
+    switch (auto.playAs(bytes, authorOf(to.who))) {
+        .started => |t| to.send(host, true, std.fmt.allocPrint(arena, ".{{ .ticket = {d} }}", .{@backingInt(t)}) catch "?"),
+        .busy => to.send(host, false, "something else is driving fizzy: a tape or a demo"),
+        .invalid => |why| to.send(host, false, why),
+    }
+}
+
+/// `agent.tapeOutcome`: how the tape `ticket` names ended, or that it plays on.
+pub fn tapeOutcome(host: *sdk.Host, to: Reply, ticket: u32) void {
+    const auto = automation(host) orelse return to.send(host, false, "this app offers no automation service");
+    var buf: [64]u8 = undefined;
+    to.send(host, true, outcomeText(&buf, auto.outcome(@fromBackingInt(@intCast(ticket)))));
+}
+
+/// `agent.profile`: the profiler's report after `ms_` of frames. `drive`: ask for every frame, to
+/// measure what drawing costs; else only the frames fizzy draws on its own are measured
+/// (`measure.zig`). `startup`: also when the app's start reached each phase.
+pub fn profile(host: *sdk.Host, to: Reply, ms_: u32, drive: bool, startup: bool) void {
+    // A window of averages is half a second: ask for a little more than was asked.
+    core.profile.want(ms_ + 600);
+    wait(host, to, .{ .profile = .{ .until = now() + ms(ms_ + 600), .drive = drive, .startup = startup } });
+}
+
+fn wait(host: *sdk.Host, to: Reply, until: @FieldType(Waiting, "until")) void {
+    waiting.append(host.allocator, .{ .to = to, .until = until }) catch to.send(host, false, "out of memory");
 }
 
 /// `image` as the bridge reads it: `"FZPX"`, its width and height (little-endian `u32`s), then its
@@ -431,55 +676,66 @@ fn later(host: *sdk.Host) bool {
 }
 
 /// True once `w` is answered.
-fn check(host: *sdk.Host, server: *Server, w: *Waiting) bool {
+/// Free what `w` holds, when it is answered without finishing.
+fn drop(host: *sdk.Host, w: *Waiting) void {
+    switch (w.until) {
+        .run => |r| r.deinit(host.allocator),
+        .build => |b| b.deinit(),
+        .capture => |c| host.allocator.free(c.path),
+        else => {},
+    }
+}
+
+fn check(host: *sdk.Host, w: *Waiting) bool {
     const auto = automation(host) orelse {
-        w.req.answer(server, false, "the automation service went away");
+        drop(host, w);
+        w.to.send(host, false, "the automation service went away");
         return true;
     };
     switch (w.until) {
         .snapshot => |t| {
             const text = auto.snapshotText(t) orelse return later(host);
-            w.req.answer(server, true, text);
+            w.to.send(host, true, text);
             return true;
         },
         .capture => |c| {
             const image = auto.captureImage(c.ticket) orelse return later(host);
             defer host.allocator.free(c.path);
             if (image.width == 0) {
-                w.req.answer(server, false, "no window has that tag: ui.snapshot lists them (.role = \"window\")");
+                w.to.send(host, false, "no window has that tag: ui.snapshot lists them (.role = \"window\")");
                 return true;
             }
             // Raw, as fizzy drew it: the bridge, in its own process, scales and encodes it.
             writeRaw(c.path, image) catch |err| {
-                w.req.answer(server, false, @errorName(err));
+                w.to.send(host, false, @errorName(err));
                 return true;
             };
-            w.req.answer(server, true, c.path);
+            w.to.send(host, true, c.path);
             return true;
         },
         .settled => |deadline| {
             if (auto.settled()) {
-                w.req.answer(server, true, "true");
+                w.to.send(host, true, "true");
                 return true;
             }
             if (now() < deadline) return false;
-            w.req.answer(server, true, "false");
+            w.to.send(host, true, "false");
             return true;
         },
         .build => |b| {
             const plugins = host.getServiceTyped(sdk.services.plugins.Api) orelse {
-                w.req.answer(server, false, "the plugins service went away");
+                w.to.send(host, false, "the plugins service went away");
                 b.deinit();
                 return true;
             };
             const report = b.advance(host, plugins, auto) orelse return false;
-            w.req.answer(server, true, report);
+            w.to.send(host, true, report);
             b.deinit();
             return true;
         },
         .run => |r| {
             const report = r.advance(host, auto) orelse return false;
-            w.req.answer(server, true, report);
+            w.to.send(host, true, report);
             r.deinit(host.allocator);
             return true;
         },
@@ -492,48 +748,48 @@ fn check(host: *sdk.Host, server: *Server, w: *Waiting) bool {
                 return false;
             }
             const p = core.profile.current() orelse {
-                w.req.answer(server, false, "no profiler in this app");
+                w.to.send(host, false, "no profiler in this app");
                 return true;
             };
             var out: std.Io.Writer.Allocating = .init(host.allocator);
             defer out.deinit();
             core.profile.report(p, &out.writer, .{ .startup = wait_p.startup }) catch {};
-            w.req.answer(server, true, out.written());
+            w.to.send(host, true, out.written());
             return true;
         },
     }
 }
 
-/// `ui.run`: a script, run across frames, answered with one report (`Run.zig`).
-fn run(host: *sdk.Host, server: *Server, req: *Server.Request, auto: *Automation, source: [:0]const u8) void {
-    const r = Run.init(host.allocator, req.conn, source) catch |err| return req.answer(server, false, switch (err) {
-        error.BadScript => "ui.run takes .{ .steps = .{ .{ .click = .{ .tag = \"...\" } }, .{ .call = .{ .id, .args } }, .{ .expect = .{ .tag } }, .{ .settle = .{} }, .{ .screen = .{} }, .{ .profile = .{ .ms } }, ... }, .timeout_ms }",
+/// `agent.run`: a script, run across frames, answered with one report (`Run.zig`).
+pub fn run(host: *sdk.Host, to: Reply, source: [:0]const u8) void {
+    const auto = automation(host) orelse return to.send(host, false, "this app offers no automation service");
+    const r = Run.init(host.allocator, to.who, source) catch |err| return to.send(host, false, switch (err) {
+        error.BadScript => "agent.run takes .{ .steps = .{ .{ .click = .{ .tag = \"...\" } }, .{ .call = .{ .id, .args } }, .{ .expect = .{ .tag } }, .{ .settle = .{} }, .{ .screen = .{} }, .{ .profile = .{ .ms } }, ... }, .timeout_ms }",
         error.OutOfMemory => "out of memory",
     });
     if (r.advance(host, auto)) |report| {
-        req.answer(server, true, report);
+        to.send(host, true, report);
         return r.deinit(host.allocator);
     }
-    wait(host, server, req, .{ .run = r });
+    wait(host, to, .{ .run = r });
 }
 
-/// `ui.act`: input as a live tape, then the screen unless `snapshot` is false. A run of its
+/// `agent.act`: input as a live tape, then the screen unless `snapshot` is false. A run of its
 /// steps, with `screen` after.
-fn act(host: *sdk.Host, server: *Server, req: *Server.Request, arena: std.mem.Allocator, source: [:0]const u8) void {
+pub fn act(host: *sdk.Host, to: Reply, arena: std.mem.Allocator, source: [:0]const u8) void {
     const Args = struct { steps: []const Run.Step, snapshot: bool = true, timeout_ms: u32 = 10_000 };
-    const a = parse(Args, arena, source) orelse return req.answer(server, false,
-        \\ui.act takes .{ .steps = .{ .{ .click = .{ .tag = "..." } }, .{ .type = "..." }, .{ .key = "mod+s" }, ... }, .snapshot = true }
+    const a = parse(Args, arena, source) orelse return to.send(host, false,
+        \\agent.act takes .{ .steps = .{ .{ .click = .{ .tag = "..." } }, .{ .type = "..." }, .{ .key = "mod+s" }, ... }, .snapshot = true }
     );
     var steps: std.ArrayListUnmanaged(Run.Step) = .empty;
-    steps.appendSlice(arena, a.steps) catch return req.answer(server, false, "out of memory");
-    if (a.snapshot) steps.append(arena, .{ .screen = .{} }) catch return req.answer(server, false, "out of memory");
+    steps.appendSlice(arena, a.steps) catch return to.send(host, false, "out of memory");
+    if (a.snapshot) steps.append(arena, .{ .screen = .{} }) catch return to.send(host, false, "out of memory");
     var out: std.Io.Writer.Allocating = .init(arena);
     // `Run.Step` nests (a `compare` holds steps): the serializer is given a depth to stop at.
     std.zon.stringify.serializeMaxDepth(Run.Args{ .steps = steps.items, .timeout_ms = a.timeout_ms }, .{ .emit_default_optional_fields = false }, &out.writer, 32) catch
-        return req.answer(server, false, "out of memory");
-    const zon = arena.dupeSentinel(u8, out.written(), 0) catch return req.answer(server, false, "out of memory");
-    const auto = automation(host) orelse return req.answer(server, false, "this app offers no automation service");
-    run(host, server, req, auto, zon);
+        return to.send(host, false, "out of memory");
+    const zon = arena.dupeSentinel(u8, out.written(), 0) catch return to.send(host, false, "out of memory");
+    run(host, to, zon);
 }
 
 fn outcomeText(buf: []u8, o: Automation.Outcome) []const u8 {
@@ -550,7 +806,7 @@ fn outcomeText(buf: []u8, o: Automation.Outcome) []const u8 {
 /// With no `prefix`, an index, a line per command: its id, its title and whether it can run, which is all an
 /// agent needs to find one, and a small part of the whole (pixi alone offers some eighty). With
 /// one, the commands whose ids start with it, parameters too.
-fn listCommands(host: *sdk.Host, server: *Server, req: *Server.Request, arena: std.mem.Allocator, prefix: []const u8) void {
+fn listCommands(host: *sdk.Host, to: Reply, arena: std.mem.Allocator, prefix: []const u8) void {
     const ParamOut = struct {
         key: []const u8,
         label: []const u8,
@@ -597,7 +853,7 @@ fn listCommands(host: *sdk.Host, server: *Server, req: *Server.Request, arena: s
         out.append(arena, .{ .id = c.id, .title = c.title, .enabled = host.commandEnabled(c.id), .params = params.items }) catch {};
     }
     if (prefix.len > 0) std.zon.stringify.serialize(out.items, .{ .emit_default_optional_fields = false }, &w.writer) catch {};
-    req.answer(server, true, w.written());
+    to.send(host, true, w.written());
 }
 
 fn parse(comptime T: type, arena: std.mem.Allocator, source: [:0]const u8) ?T {

@@ -1,19 +1,21 @@
 //! Lets an AI agent drive fizzy the way a person does (fizzyedit/plans, `plans/AGENTS_PLAN.md`).
 //!
-//! A socket only this user can open (`src/Server.zig`) takes requests from `fizzy-mcp`, the MCP
-//! bridge in this repo, and the plugin answers them on the UI thread, in `beginFrame`
-//! (`src/tools.zig`): every command as a tool, with its parameters; the screen as text (the
-//! `automation` service's snapshot); input as live tapes; the profiler on request. Nothing here is
+//! Its tools are `agent.*` commands (`src/commands.zig`): scripts, input as live tapes, builds,
+//! pictures, the profiler on request, holding a document. Fizzy's control server serves them as
+//! it serves every command (`/mcp`), each call the caller's step. A socket only this user can open
+//! (`src/Server.zig`) takes requests from `fizzy-mcp`, the MCP bridge in this repo, and routes
+//! them to the same commands on the UI thread, in `beginFrame` (`src/tools.zig`). Nothing here is
 //! a back door — commands are the ones plugins offer, and input goes through the same widgets a
 //! person's does, so everything shows on screen and in undo, and a person's click stops it.
 //!
-//! Desktop only: a wasm side module cannot open a socket.
+//! The socket is desktop only: a wasm side module cannot open one. The commands are not.
 const std = @import("std");
 const builtin = @import("builtin");
 const sdk = @import("fizzy_sdk");
 const dvui = @import("dvui");
 const Server = @import("src/Server.zig");
 const tools = @import("src/tools.zig");
+const commands = @import("src/commands.zig");
 
 pub const plugin_options = @import("fizzy_plugin_options");
 pub const plugin_id = plugin_options.id;
@@ -39,7 +41,9 @@ pub fn register(h: *sdk.Host) !void {
     host = h;
     plugin.state = @ptrCast(&state);
     tools.owner = &plugin;
+    tools.the_host = h;
     try h.registerPlugin(&plugin);
+    try commands.register(h, &plugin);
 }
 
 fn initPlugin(_: *anyopaque) anyerror!void {
@@ -73,6 +77,7 @@ fn initPlugin(_: *anyopaque) anyerror!void {
         .wake = wake,
     };
     try writeConnection(dir, socket_path, &token);
+    tools.the_server = &server.?;
     try server.?.start();
     std.log.info("agent: listening on {s}", .{socket_path});
 }
@@ -97,14 +102,15 @@ fn wake() void {
 }
 
 fn beginFrame(_: *anyopaque) void {
-    if (server) |*s| tools.frame(host, s);
+    tools.frame(host);
 }
 
 fn deinit(_: *anyopaque) void {
+    tools.deinit(host);
     if (server) |*s| {
-        tools.deinit(host, s);
         s.stop();
         host.allocator.free(s.socket_path);
     }
+    tools.the_server = null;
     server = null;
 }
