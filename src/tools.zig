@@ -70,22 +70,53 @@ pub const Reply = struct {
     /// Answer, with whatever the caller should hear besides (a claim the person stopped) after it
     /// as a ZON comment, which leaves a ZON result readable.
     pub fn send(self: Reply, host: *sdk.Host, ok: bool, text: []const u8) void {
-        const notice = takeNotice(self.who);
+        const notice = if (self.outermost(host)) takeNotice(self.who) else null;
         defer if (notice) |n| host.allocator.free(n);
         switch (self.to) {
             .req => |r| {
+                // The server is gone only once every request was answered (`deinit`).
+                const server = the_server orelse return;
                 if (notice) |n| r.notice = host.allocator.dupe(u8, n) catch null;
-                r.answer(the_server.?, ok, text);
+                r.answer(server, ok, text);
             },
             .ticket => |t| {
-                const with = if (notice) |n| std.fmt.allocPrint(host.allocator, "{s}\n// {s}", .{ text, n }) catch null else null;
+                const with = if (notice) |n| std.fmt.allocPrint(host.allocator, "{s}\n// {s}\n", .{ text, n }) catch null else null;
                 defer if (with) |w| host.allocator.free(w);
                 const out = with orelse text;
                 host.finishCall(t, if (ok) .{ .ok = out } else .{ .failed = out });
             },
         }
     }
+
+    /// Whether this answer goes straight to whoever called from outside, so a notice may ride
+    /// on it: a socket request, the call running now when no agent's call is around it, or a
+    /// later answer someone waits for. Not an answer that becomes part of another (a script's
+    /// `call` step, `agent.call` reaching an `agent.*` command), whose ZON a comment would break
+    /// and whose reader is not the agent; the notice waits for an answer that is.
+    fn outermost(self: Reply, host: *sdk.Host) bool {
+        return switch (self.to) {
+            .req => true,
+            .ticket => |t| embedding == 0 and (host.callWanted(t) or
+                if (host.running_call) |c| c.ticket == t else false),
+        };
+    }
 };
+
+/// How many of the agent's own calls are running around now (`agentCallAwaiting`): an answer
+/// given inside one is part of another answer (`Reply.outermost`).
+var embedding: u32 = 0;
+
+/// Socket requests whose command answers later, by its ticket: answered at `deinit` if it has
+/// not, since a request's thread waits until it is, and `Server.stop` waits for the thread. UI
+/// thread only.
+var socket_calls: std.ArrayListUnmanaged(struct { req: *Server.Request, ticket: u32 }) = .empty;
+/// `agent.call`s whose command answers later (`LaterCall`), answered at `deinit` if not yet.
+var later_calls: std.ArrayListUnmanaged(*LaterCall) = .empty;
+
+/// What makes this load's socket authors its own: a connection's number starts again at each
+/// load, and the host keeps its authors across loads, so a new connection 1 must not be the last
+/// load's connection 1 (its steps merged into theirs, its name over theirs).
+var load_nonce: u32 = 0;
 
 fn now() i96 {
     return std.Io.Clock.boot.now(dvui.io).nanoseconds;
@@ -136,7 +167,10 @@ fn indexOf(host: *sdk.Host, a: sdk.Author) u32 {
 
 /// Socket connection `conn`, as an author.
 fn connAuthor(host: *sdk.Host, conn: u32) u32 {
-    return indexOf(host, .{ .kind = .agent, .plugin = "agent", .session = conn, .label = labels.get(conn) orelse "An agent" });
+    if (load_nonce == 0) dvui.io.random(std.mem.asBytes(&load_nonce));
+    load_nonce |= 1;
+    const id = @as(u64, load_nonce) << 32 | conn;
+    return indexOf(host, .{ .kind = .agent, .plugin = "agent", .session = id, .label = labels.get(conn) orelse "An agent" });
 }
 
 /// Who is calling a command now: the acting author when it is an agent (the control server's
@@ -173,6 +207,8 @@ pub fn frame(host: *sdk.Host) void {
         defer closed_authors.deinit(host.allocator);
         for (closed.items) |c| closed_authors.append(host.allocator, connAuthor(host, c)) catch {};
         tendClaims(host, closed_authors.items);
+        // Nobody is left to hear a closed connection's notices: its answers are done.
+        for (closed_authors.items) |who| while (takeNotice(who)) |n| host.allocator.free(n);
         for (closed.items) |c| if (labels.fetchRemove(c)) |kv| host.allocator.free(kv.value);
         for (batch.items) |req| handle(host, req);
     } else tendClaims(host, &.{});
@@ -187,13 +223,22 @@ pub fn frame(host: *sdk.Host) void {
 
 /// Answer whatever still waits: fizzy is going, or the plugin is.
 pub fn deinit(host: *sdk.Host) void {
-    for (waiting.items) |w| {
-        switch (w.until) {
-            .run => |r| r.deinit(host.allocator),
-            .build => |b| b.deinit(),
-            .capture => |c| host.allocator.free(c.path),
-            else => {},
-        }
+    // Calls waiting on other commands first: answering an `agent.call` may answer the socket
+    // request waiting on it. The host may have let go of their sinks already (a plugin being
+    // retired loses its waits before its `deinit`), so each is answered here, not through it.
+    for (later_calls.items) |c| {
+        host.abandonCall(c.inner);
+        c.to.send(host, false, "fizzy is closing");
+        c.free(host.allocator);
+    }
+    later_calls.deinit(host.allocator);
+    for (socket_calls.items) |c| {
+        host.abandonCall(c.ticket);
+        if (the_server) |server| c.req.answer(server, false, "fizzy is closing");
+    }
+    socket_calls.deinit(host.allocator);
+    for (waiting.items) |*w| {
+        drop(host, w);
         w.to.send(host, false, "fizzy is closing");
     }
     waiting.deinit(host.allocator);
@@ -282,7 +327,9 @@ fn agentCallAwaiting(host: *sdk.Host, who: u32, id: []const u8, args: []const u8
     // the steps it records are this author's.
     host.openBeside();
     const outer = host.act(authorOf(who));
+    embedding += 1;
     const out = host.callCommandAwaiting(id, args, arena, sink);
+    embedding -= 1;
     host.endAct(outer);
     host.endOpenBeside();
     if (out == .now and out.now == .ok) if (doc_path) |p| note(host, who, p, id, args);
@@ -305,10 +352,16 @@ const LaterCall = struct {
     id: []u8,
     args: []u8,
     path: ?[]u8,
+    /// The command's own ticket, which this waits on.
+    inner: u32 = 0,
 
     fn done(ctx: *anyopaque, outcome: sdk.Host.CommandOutcome) void {
         const self: *LaterCall = @ptrCast(@alignCast(ctx));
         const host = the_host orelse return;
+        for (later_calls.items, 0..) |c, i| if (c == self) {
+            _ = later_calls.swapRemove(i);
+            break;
+        };
         if (outcome == .ok) if (self.path) |p| note(host, self.to.who, p, self.id, self.args);
         answerOutcome(host, self.to, outcome);
         self.free(host.allocator);
@@ -383,7 +436,7 @@ pub fn release(host: *sdk.Host, to: Reply, arena: std.mem.Allocator, claim_id: u
         }
         if (h.claim) |c| host.releaseClaim(c);
         if (finish(host, h)) |t| {
-            tapes.append(arena, arena.dupe(u8, t) catch t) catch {};
+            if (arena.dupe(u8, t)) |copy| tapes.append(arena, copy) catch {} else |_| {}
             host.allocator.free(t);
         }
         host.allocator.free(h.path);
@@ -492,7 +545,10 @@ fn handle(host: *sdk.Host, req: *Server.Request) void {
     host.endAct(outer);
     switch (out) {
         .now => |o| answerOutcome(host, to, o),
-        .later => {},
+        .later => |t| socket_calls.append(host.allocator, .{ .req = req, .ticket = t }) catch {
+            host.abandonCall(t);
+            to.send(host, false, "out of memory");
+        },
     }
 }
 
@@ -500,6 +556,10 @@ fn handle(host: *sdk.Host, req: *Server.Request) void {
 fn answerRequest(ctx: *anyopaque, outcome: sdk.Host.CommandOutcome) void {
     const req: *Server.Request = @ptrCast(@alignCast(ctx));
     const host = the_host orelse return;
+    for (socket_calls.items, 0..) |c, i| if (c.req == req) {
+        _ = socket_calls.swapRemove(i);
+        break;
+    };
     answerOutcome(host, .{ .who = connAuthor(host, req.conn), .to = .{ .req = req } }, outcome);
 }
 
@@ -525,7 +585,14 @@ pub fn call(host: *sdk.Host, to: Reply, arena: std.mem.Allocator, id: []const u8
             pending.free(gpa);
             answerOutcome(host, to, o);
         },
-        .later => {},
+        .later => |t| {
+            pending.inner = t;
+            later_calls.append(gpa, pending) catch {
+                host.abandonCall(t);
+                pending.free(gpa);
+                to.send(host, false, "out of memory");
+            };
+        },
     }
 }
 
@@ -534,7 +601,10 @@ pub fn capture(host: *sdk.Host, to: Reply, path: []const u8, window: []const u8)
     const auto = automation(host) orelse return to.send(host, false, "this app offers no automation service");
     if (!std.fs.path.isAbsolute(path)) return to.send(host, false, "give the picture's path as an absolute path");
     const owned = host.allocator.dupe(u8, path) catch return to.send(host, false, "out of memory");
-    wait(host, to, .{ .capture = .{ .ticket = auto.capture(window), .path = owned } });
+    waiting.append(host.allocator, .{ .to = to, .until = .{ .capture = .{ .ticket = auto.capture(window), .path = owned } } }) catch {
+        host.allocator.free(owned);
+        to.send(host, false, "out of memory");
+    };
 }
 
 /// `agent.build`: build a plugin, wait for it to reload, run its check (`Build.zig`).
@@ -606,8 +676,19 @@ fn later(host: *sdk.Host) bool {
 }
 
 /// True once `w` is answered.
+/// Free what `w` holds, when it is answered without finishing.
+fn drop(host: *sdk.Host, w: *Waiting) void {
+    switch (w.until) {
+        .run => |r| r.deinit(host.allocator),
+        .build => |b| b.deinit(),
+        .capture => |c| host.allocator.free(c.path),
+        else => {},
+    }
+}
+
 fn check(host: *sdk.Host, w: *Waiting) bool {
     const auto = automation(host) orelse {
+        drop(host, w);
         w.to.send(host, false, "the automation service went away");
         return true;
     };
