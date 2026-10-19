@@ -286,6 +286,7 @@ pub fn main(init: std.process.Init) !void {
     };
     defer bridge.disconnect();
     defer if (bridge.hello) |h| gpa.free(h);
+    defer if (bridge.client) |c| gpa.free(c);
 
     var in_buf: [1 << 16]u8 = undefined;
     var out_buf: [1 << 16]u8 = undefined;
@@ -337,6 +338,9 @@ pub const Bridge = struct {
     next_id: u64 = 1,
     /// What fizzy said to the last `hello`: its tools and the executable it runs from. Owned.
     hello: ?[]u8 = null,
+    /// The MCP client's name from `initialize` ("claude-code"), said with `hello` so fizzy shows
+    /// whose steps these are. Owned.
+    client: ?[]u8 = null,
 
     /// A connection to the plugin, said hello on.
     const Link = struct {
@@ -376,7 +380,7 @@ pub const Bridge = struct {
         link.writer = stream.writer(self.io, &link.write_buf);
         self.link = link;
         var hello: std.Io.Writer.Allocating = .init(arena);
-        try std.zon.stringify.serialize(.{ .token = c.token }, .{ .whitespace = false }, &hello.writer);
+        try std.zon.stringify.serialize(.{ .token = c.token, .client = self.client orelse "" }, .{ .whitespace = false }, &hello.writer);
         return switch (try self.exchange(arena, "hello", hello.written())) {
             .ok => |s| {
                 self.keepHello(s);
@@ -497,6 +501,12 @@ pub const Bridge = struct {
         } else null;
 
         if (eql(method, "initialize")) {
+            if (params) |p| if (p.get("clientInfo")) |info| if (info == .object) if (info.object.get("name")) |n| if (n == .string) {
+                if (self.client) |c| self.gpa.free(c);
+                self.client = self.gpa.dupe(u8, n.string) catch null;
+                // A hello said before the client named itself goes again, with the name.
+                self.disconnect();
+            };
             const version = if (params) |p| if (p.get("protocolVersion")) |v| switch (v) {
                 .string => |s| s,
                 else => protocol_version,

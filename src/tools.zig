@@ -7,7 +7,7 @@
 //!
 //! | tool | arguments | result |
 //! |---|---|---|
-//! | `hello` | `.{ .token }` | the tools, what fizzy offers, and the executable it runs from |
+//! | `hello` | `.{ .token, .client }` | the tools, what fizzy offers, and the executable it runs from |
 //! | `commands.list` | `.{ .prefix }` | no prefix: a line per command, its id and title (and "(not now)" when it cannot run); with one (`"pixi."`, or a whole id): those commands in full, parameters too (kind, description, default) |
 //! | `commands.call` | `.{ .id, .args = "<ZON>" }` | its result, or why not |
 //! | `ui.snapshot` | — | what is on screen (`automation` service): fizzy's windows, then each widget's role, name, tag, rect, parent and window |
@@ -71,6 +71,15 @@ const Held = struct {
     rec: ?Recording = null,
 };
 
+/// What each connection is called, from its client's name in `hello` ("Claude"): what the
+/// person reads beside its steps (`sdk.Author.label`). A connection with no name is "An agent".
+var labels: std.AutoHashMapUnmanaged(u32, []u8) = .empty;
+
+/// Connection `conn`, as the author of what it does.
+pub fn author(conn: u32) sdk.Author {
+    return .{ .kind = .agent, .plugin = "agent", .session = conn, .label = labels.get(conn) orelse "An agent" };
+}
+
 /// What a connection should hear with its next answer: a claim the person stopped.
 var notices: std.ArrayListUnmanaged(struct { conn: u32, text: []u8 }) = .empty;
 
@@ -82,6 +91,7 @@ pub fn frame(host: *sdk.Host, server: *Server) void {
     defer closed.deinit(host.allocator);
     server.take(&batch, &closed);
     tendClaims(host, server, closed.items);
+    for (closed.items) |c| if (labels.fetchRemove(c)) |kv| host.allocator.free(kv.value);
     for (batch.items) |req| {
         attachNotice(server, req);
         handle(host, server, req);
@@ -114,6 +124,9 @@ pub fn deinit(host: *sdk.Host, server: *Server) void {
     held.deinit(host.allocator);
     for (notices.items) |n| server.gpa.free(n.text);
     notices.deinit(host.allocator);
+    var it = labels.valueIterator();
+    while (it.next()) |l| host.allocator.free(l.*);
+    labels.deinit(host.allocator);
 }
 
 /// End the sessions of closed connections and on closed documents, and turn claims the person
@@ -179,18 +192,27 @@ pub fn agentCall(host: *sdk.Host, conn: u32, id: []const u8, args: []const u8, a
         .{ id, active },
     ) catch "undo acts on the active document, which is not yours" };
     const doc_path: ?[]const u8 = if (target(host, id, arena.dupeSentinel(u8, args, 0) catch "", arena)) |doc| blk: {
-        const h = session(host, conn, doc, "An agent") catch break :blk null;
+        const h = session(host, conn, doc, author(conn).label) catch break :blk null;
         break :blk arena.dupe(u8, h.path) catch null;
     } else null;
-    // What the command opens or creates lands beside the person, not over their document.
+    // What the command opens or creates lands beside the person, not over their document, and
+    // the steps it records are this connection's.
     host.openBeside();
+    const outer = host.act(author(conn));
     const out = host.callCommand(id, args, arena);
+    host.endAct(outer);
     host.endOpenBeside();
     if (out == .ok) if (doc_path) |p| for (held.items) |*h| {
         if (h.conn != conn or !eql(h.path, p)) continue;
         if (h.rec) |*rec| rec.note(id, args, host.last_showing_ms) catch {};
     };
     return out;
+}
+
+/// What the person reads for an MCP client's name: "Claude" for Claude's clients
+/// ("claude-code", "claude-ai"), else the name as given.
+fn clientLabel(client: []const u8) []const u8 {
+    return if (std.ascii.startsWithIgnoreCase(client, "claude")) "Claude" else client;
 }
 
 /// Undo and redo (`fizzy.undo`, `pixi.redo`, ...) take no document: they act on the active one.
@@ -288,6 +310,12 @@ fn handle(host: *sdk.Host, server: *Server, req: *Server.Request) void {
     const tool = req.tool;
 
     if (eql(tool, "hello")) {
+        // The client's name, as its MCP client gave it ("claude-code"): the label its steps carry.
+        if (parse(struct { client: []const u8 = "" }, arena, source)) |a| if (a.client.len > 0) {
+            if (host.allocator.dupe(u8, clientLabel(a.client))) |l| {
+                if (labels.fetchPut(host.allocator, req.conn, l) catch null) |old| host.allocator.free(old.value);
+            } else |_| {}
+        };
         // The executable this fizzy runs from: the bridge compares it across an app build to tell
         // whether fizzy will restart into a new one (`fizzy_build` on an app's repo).
         var buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -349,7 +377,7 @@ fn handle(host: *sdk.Host, server: *Server, req: *Server.Request) void {
         return wait(host, server, req, .{ .build = b });
     }
     if (eql(tool, "tape.play")) {
-        return switch (auto.play(req.args)) {
+        return switch (auto.playAs(req.args, author(req.conn))) {
             .started => |t| req.answer(server, true, std.fmt.allocPrint(arena, ".{{ .ticket = {d} }}", .{@backingInt(t)}) catch "?"),
             .busy => req.answer(server, false, "something else is driving fizzy: a tape or a demo"),
             .invalid => |why| req.answer(server, false, why),

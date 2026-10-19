@@ -420,7 +420,7 @@ fn playTape(self: *Run, auto: *Automation, steps: []const Step) !Automation.Tick
     const owned = try s.finish();
     var bytes: std.Io.Writer.Allocating = .init(arena);
     try owned.tape.write(&bytes.writer);
-    return switch (auto.play(bytes.written())) {
+    return switch (auto.playAs(bytes.written(), tools.author(self.conn))) {
         .started => |t| t,
         .busy => error.SomethingElseIsDrivingFizzy,
         .invalid => error.NotALiveTape,
