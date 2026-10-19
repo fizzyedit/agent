@@ -53,19 +53,31 @@ again after fizzy restarts.
 
 ## How it fits together
 
+The tools are commands: `agent.run`, `agent.act`, `agent.build`, `agent.capture`, `agent.tape`,
+`agent.tapeOutcome`, `agent.profile`, `agent.claim`, `agent.release`, and `agent.call` (another
+command, as the agent's step: shown beside the person, recorded into the session's tape). Fizzy's
+control server serves them as it serves every command, so an agent reaches them two ways:
+
 ```
-agent ⇄ MCP (JSON-RPC, stdio) ⇄ fizzy-mcp ⇄ Unix socket (ZON lines) ⇄ agent plugin ⇄ fizzy
+agent ⇄ MCP (Streamable HTTP) ⇄ fizzy's control server (/mcp) ⇄ agent.* commands
+agent ⇄ MCP (stdio) ⇄ fizzy-mcp ⇄ Unix socket (ZON lines) ⇄ agent.* commands
 ```
 
-- `plugin.zig`: on load, opens a Unix socket in the plugin's directory and writes
-  `connection.zon` beside it (the socket's path and a fresh token, readable by this user only).
+Each call is the caller's step (`sdk.Author`): the socket's connection, named by its MCP
+client, or whoever the control server says is calling (one "An agent" until it says).
+
+- `plugin.zig`: registers the commands; on load, opens a Unix socket in the plugin's directory
+  and writes `connection.zon` beside it (the socket's path and a fresh token, readable by this
+  user only).
+- `src/commands.zig`: the commands and their parameters.
 - `src/Server.zig`: the socket's thread. It checks the token on `hello`, hands each request to
   the UI thread, and wakes the app to answer it.
-- `src/tools.zig`: the tools, answered on the UI thread in `beginFrame`. Some answer in the same
-  frame; the rest (a snapshot, a tape, a measurement) wait across frames and ask for each frame
-  they need.
+- `src/tools.zig`: what the tools do, on the UI thread in `beginFrame`, and the socket's routing
+  to the commands. Some answer in the same frame; the rest (a snapshot, a tape, a measurement)
+  wait across frames and ask for each frame they need.
 - `bridge/main.zig`: `fizzy-mcp`, standard library only. It turns MCP calls into the plugin's
-  requests, and JSON arguments into ZON.
+  requests, and JSON arguments into ZON. It goes once `fizzy mcp` serves stdio onto the control
+  server (`plans/AGENTS_ANYWHERE_PLAN.md`, step 3).
 
-Desktop only: a wasm side module cannot open a socket. On Windows, `std`'s Unix sockets are
+The socket is desktop only: a wasm side module cannot open one. On Windows, `std`'s Unix sockets are
 untested here.

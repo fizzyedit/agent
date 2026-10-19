@@ -25,8 +25,8 @@ const Automation = sdk.services.automation.Api;
 
 /// Owns the steps and every string they hold, for the run's life.
 arena: std.heap.ArenaAllocator,
-/// The connection the run came on: its `call` steps are that agent's (`tools.agentCall`).
-conn: u32,
+/// Who ran it, as an index into the host's authors: its `call` steps are theirs (`tools.agentCall`).
+who: u32,
 steps: []const Step,
 /// How long a wait in a tape, or `settle`, holds before the run fails.
 timeout_ms: u32,
@@ -134,22 +134,22 @@ pub const Args = struct {
 };
 
 /// A run of `source` (ZON: `Args`), or why it cannot be one. The caller `deinit`s it.
-pub fn init(gpa: std.mem.Allocator, conn: u32, source: [:0]const u8) error{ BadScript, OutOfMemory }!*Run {
+pub fn init(gpa: std.mem.Allocator, who: u32, source: [:0]const u8) error{ BadScript, OutOfMemory }!*Run {
     var arena: std.heap.ArenaAllocator = .init(gpa);
     errdefer arena.deinit();
     var diag: std.zon.parse.Diagnostics = undefined;
     const args = std.zon.parse.fromSlice(Args, .{ .gpa = arena.allocator(), .arena = arena.allocator(), .source = source, .diagnostics = &diag, .ignore_unknown_fields = true }) catch
         return error.BadScript;
     const self = try gpa.create(Run);
-    self.* = .{ .arena = arena, .conn = conn, .steps = args.steps, .timeout_ms = args.timeout_ms, .report = .init(gpa) };
+    self.* = .{ .arena = arena, .who = who, .steps = args.steps, .timeout_ms = args.timeout_ms, .report = .init(gpa) };
     self.report.writer.writeAll(".{\n    .steps = .{\n") catch return error.OutOfMemory;
     return self;
 }
 
 /// A run of `steps` (borrowed: the caller keeps them alive), as `compare` runs its own.
-fn ofSteps(gpa: std.mem.Allocator, conn: u32, steps: []const Step, timeout_ms: u32) error{OutOfMemory}!*Run {
+fn ofSteps(gpa: std.mem.Allocator, who: u32, steps: []const Step, timeout_ms: u32) error{OutOfMemory}!*Run {
     const self = try gpa.create(Run);
-    self.* = .{ .arena = .init(gpa), .conn = conn, .steps = steps, .timeout_ms = timeout_ms, .report = .init(gpa) };
+    self.* = .{ .arena = .init(gpa), .who = who, .steps = steps, .timeout_ms = timeout_ms, .report = .init(gpa) };
     self.report.writer.writeAll(".{\n    .steps = .{\n") catch return error.OutOfMemory;
     return self;
 }
@@ -258,7 +258,7 @@ fn poll(self: *Run, host: *sdk.Host, auto: *Automation) bool {
             .before => {
                 if (now() < c.until) return false;
                 c.before = measure.Snapshot.take(self.arena.allocator());
-                c.run = ofSteps(self.arena.child_allocator, self.conn, c.steps, self.timeout_ms) catch {
+                c.run = ofSteps(self.arena.child_allocator, self.who, c.steps, self.timeout_ms) catch {
                     self.fail("out of memory");
                     return true;
                 };
@@ -333,7 +333,7 @@ fn begin(self: *Run, host: *sdk.Host, auto: *Automation) void {
     }
     switch (step) {
         .call => |c| {
-            const out = tools.agentCall(host, self.conn, c.id, c.args, self.arena.allocator());
+            const out = tools.agentCall(host, self.who, c.id, c.args, self.arena.allocator());
             switch (out) {
                 .ok => |r| {
                     w.print("        .{{ .step = {d}, .call = \"{s}\", .result = ", .{ self.at, c.id }) catch {};
@@ -420,7 +420,7 @@ fn playTape(self: *Run, auto: *Automation, steps: []const Step) !Automation.Tick
     const owned = try s.finish();
     var bytes: std.Io.Writer.Allocating = .init(arena);
     try owned.tape.write(&bytes.writer);
-    return switch (auto.playAs(bytes.written(), tools.author(self.conn))) {
+    return switch (auto.playAs(bytes.written(), tools.authorOf(self.who))) {
         .started => |t| t,
         .busy => error.SomethingElseIsDrivingFizzy,
         .invalid => error.NotALiveTape,
