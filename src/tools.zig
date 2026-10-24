@@ -321,6 +321,7 @@ fn agentCallAwaiting(host: *sdk.Host, who: u32, id: []const u8, args: []const u8
     ) catch "undo acts on the active document, which is not yours" } };
     const doc_path: ?[]const u8 = if (target(host, id, arena.dupeSentinel(u8, args, 0) catch "", arena)) |doc| blk: {
         const h = session(host, who, doc, authorOf(who).label) catch break :blk null;
+        if (h.rec) |*rec| keyframeOthers(host, rec, doc);
         break :blk arena.dupe(u8, h.path) catch null;
     } else null;
     // What the command opens or creates lands beside the person, not over their document, and
@@ -336,12 +337,27 @@ fn agentCallAwaiting(host: *sdk.Host, who: u32, id: []const u8, args: []const u8
     return out;
 }
 
-/// Note step `id` in `who`'s session on `path`, for its tape.
+/// Note step `id` in `who`'s session on `path`, for its tape, and what the document is after it.
 fn note(host: *sdk.Host, who: u32, path: []const u8, id: []const u8, args: []const u8) void {
     for (held.items) |*h| {
         if (h.who != who or !eql(h.path, path)) continue;
-        if (h.rec) |*rec| rec.note(id, args, host.last_showing_ms) catch {};
+        const rec = if (h.rec) |*r| r else continue;
+        rec.note(id, args, host.last_showing_ms) catch {};
+        const doc = host.docFromPath(path) orelse continue;
+        const bytes = rec.current(doc) catch continue;
+        defer rec.gpa.free(bytes);
+        rec.settle(bytes) catch {};
     }
+}
+
+/// Before a step on `doc`: if it is not what the session's last step left, another hand changed it
+/// (the person, another agent), and the tape gets a keyframe of it, credited to whoever made the
+/// top step of its history.
+fn keyframeOthers(host: *sdk.Host, rec: *Recording, doc: sdk.DocHandle) void {
+    const bytes = rec.current(doc) catch return;
+    defer rec.gpa.free(bytes);
+    const by = if (host.topStep(doc.id)) |top| (if (top.author.kind == .person or top.author.label.len == 0) "The person" else top.author.label) else "The person";
+    rec.adopt(bytes, by) catch {};
 }
 
 /// An `agent.call` whose command answers later: who to answer, and the step to note then. Owns
