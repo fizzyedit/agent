@@ -51,7 +51,17 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .root_source_file = b.path("src/diagnostics.zig"),
     }) });
-    const test_step = b.step("test", "Run the std-only tests: the bridge's, and reading compiler diagnostics");
+    const recording = b.addTest(.{ .root_module = b.createModule(.{
+        .target = target,
+        .optimize = optimize,
+        .root_source_file = b.path("src/Recording.zig"),
+        .imports = &.{
+            .{ .name = "fizzy_sdk", .module = sdk.module("fizzy_sdk") },
+            .{ .name = "tape", .module = sdk.module("tape") },
+        },
+    }) });
+    const test_step = b.step("test", "Run the tests: the bridge's, reading compiler diagnostics, and a session's tape");
+    test_step.dependOn(&b.addRunArtifact(recording).step);
     test_step.dependOn(&b.addRunArtifact(tests).step);
     test_step.dependOn(&b.addRunArtifact(diagnostics).step);
 }
